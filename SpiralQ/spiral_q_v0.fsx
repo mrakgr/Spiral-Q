@@ -37,19 +37,15 @@ type StreamPool(num) =
     member t.P = 
         p <- p + 1
         let (s,e as t) = ar.[p % num]
-        //if e.Query() = false then e.Synchronize() // If the stream is in use, then block on the associated event.
-        s.WaitEvent e.Event // Why not just use this instead? Edit: It speeds up the example 100% compared to the above.
+        s.WaitEvent e.Event
         t
 
 let StreamPool = new StreamPool(128) // 1024 of them take roughly 50Mb, so I've settled on the 128 number.
 
-let str,_ = StreamPool.P
 // Set the Cuda libraries handles to the above stream.
-let cublas = CudaBlas(str.Stream,PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
+let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
 let cudnn = new CudaDNNContext()
-cudnn.SetStream(str)
 let cudaRandom = new CudaRand.CudaRandDevice(GeneratorType.PseudoDefault)
-cudaRandom.SetStream(str.Stream)
 
 // I'll skip aliasing float32 to floatType for this iteration of the library. There is not point to it as Cuda native functions cannot be overloaded this way.
 
@@ -84,24 +80,77 @@ let inline ptr_to_device_variable nchw (x : CUdeviceptr) =
 /// The float scalar type
 type Df = 
     {
-    P : float32 ref // primal
+    P : Lazy<float32> ref // primal
     A : float32 ref // adjoint
     }
 
     static member inline create P =
-        {P=P;A=ref 0.0f}
+        {P=ref (lazy P);A=ref 0.0f}
 
-/// The main matrix type.
+
+/// Wait for all the event in the occupancy array to finish.
 let wait_on_event (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
         occupied_ar
         |> Seq.iter (fun x -> s.WaitEvent x.Event)
+
+/// Projects nchw dimensions to a row, column dimension according to the following formula:
+/// row = c*h*w
+/// column = n
+let nchw_to_2d (n,c,h,w:int) = c*h*w, n
+
+type DeadFlagType =
+| Undefined
+| Dead
+| Alive
+
+let module_nullary_stream_function x_occ (f : CUstream -> unit) =
+    let s,e = StreamPool.P
+    wait_on_event s x_occ
+    
+    f s.Stream
+
+    e.Record s.Stream
+    x_occ.Add e
+
+let module_unary_stream_function x_occ o_occ (f : CUstream -> unit) =
+    let s,e = StreamPool.P
+    wait_on_event s x_occ
+    wait_on_event s o_occ
+
+    f s.Stream
+
+    e.Record s.Stream
+    o_occ.Add e
+
+let module_binary_stream_function x_occ y_occ o_occ (f : CUstream -> unit) =
+    let s,e = StreamPool.P
+    wait_on_event s x_occ
+    wait_on_event s y_occ
+    wait_on_event s o_occ
+
+    f s.Stream
+
+    e.Record s.Stream
+    o_occ.Add e
+
+let module_trinary_stream_function x_occ y_occ z_occ o_occ (f : CUstream -> unit) =
+    let s,e = StreamPool.P
+    wait_on_event s x_occ
+    wait_on_event s y_occ
+    wait_on_event s z_occ
+    wait_on_event s o_occ
+
+    f s.Stream
+
+    e.Record s.Stream
+    o_occ.Add e
 
 type d4MUnion =
     {
     mutable elements : ((int * int * int * int) * CUdeviceptr * CUdeviceptr option)[]
     mutable P: CudaDeviceVariable<float32> // primal
     mutable A: CudaDeviceVariable<float32> option // adjoint
-    mutable is_dead : bool // flag to skip backprop
+    mutable is_dead : DeadFlagType // flag to skip backprop
     mutable primal_occupied : ResizeArray<CudaEvent>
     mutable adjoint_occupied : ResizeArray<CudaEvent>
     }  
@@ -126,7 +175,7 @@ type d4MUnion =
         let p,a = l |> Array.last |> fun x -> x / sizeof<float32> |> SizeT |> fun x -> new CudaDeviceVariable<float32>(x), if is_constant = false then new CudaDeviceVariable<float32>(x) |> Some else None
         let elements = d4MUnion.make_elements p a ar l
         
-        {elements = elements; P=p; A=a; is_dead=false; primal_occupied = ResizeArray(); adjoint_occupied = ResizeArray()}
+        {elements = elements; P=p; A=a; is_dead=Undefined; primal_occupied = ResizeArray(); adjoint_occupied = ResizeArray()}
 
     static member private create' (ar_data : ((int * int * int * int) * float32[]) [], is_constant) =
         let ar, data = Array.unzip ar_data
@@ -163,7 +212,20 @@ type d4MUnion =
         if t.elements.Length <> 1 then failwithf "t.elements.Length(%i) <> 1" t.elements.Length
         else
             t.elements.[0]
-            |> fun (nchw,_,a) -> nchw,a.Value,t.primal_occupied
+            |> fun (nchw,_,a) -> nchw,a.Value,t.adjoint_occupied
+
+    /// Checks if the type is singular and then returns its dimensions.
+    member t.nchw = 
+        if t.elements.Length <> 1 then failwithf "t.elements.Length(%i) <> 1" t.elements.Length
+        else
+            t.elements.[0]
+            |> fun (nchw,_,_) -> nchw
+
+    /// Checks if the type is singular and then returns its dimensions projected 
+    /// to a 2D space according to the following formula:
+    /// row = c*h*w
+    /// column = n
+    member t.rc = t.nchw |> nchw_to_2d
 
     /// Gets the slice by iteratively incrementing n if the other dimensions are equal.
     /// Does not do any layout transformation. The same as GetSliceAlongChannel.
@@ -188,6 +250,25 @@ type d4MUnion =
                 if n' <> n || h' <> h || w' <> w then failwithf "n'(%i) <> n(%i) || h'(%i) <> h(%i) || w'(%i) <> w(%i)" n' n h' h w' w
                 c <- c + c'
         (n,c,h,w), p, a
+
+    /// Sets the adjoint to zero.
+    member inline t.setZeroAdjoint() = 
+        match t.A with
+        | Some A -> 
+            module_nullary_stream_function t.adjoint_occupied
+            <| fun s -> A.MemsetAsync(0u,s)
+        | None -> ()
+
+    /// Sets the primal to zero.
+    member inline t.setZeroPrimal() = 
+        module_nullary_stream_function t.primal_occupied
+        <| fun s -> t.P.MemsetAsync(0u,s)
+
+    /// Set the matrix to a value.
+    member inline t.setPrimal (x: float32) = 
+        let v = BitConverter.ToUInt32(BitConverter.GetBytes(x),0)
+        module_nullary_stream_function t.primal_occupied
+        <| fun s -> t.P.MemsetAsync(v,s)
 
     member t.ReplaceIf (ar : (int * int * int * int)[]) =
         let l = d4MUnion.ar_scan ar
@@ -284,6 +365,7 @@ type ConvolutionDescriptor with
         t.GetConvolution2dForwardOutputDim(s,f,&n,&c,&h,&w)
         n,c,h,w
 
+let mutable inference_only_flag = false
 /// The new object pool. Zeroes out the adjoints concurrently on the forward phase.
 type ObjectPool() =
     let d4MPool = ResizeArray()
@@ -350,15 +432,10 @@ type ObjectPool() =
             | true -> ObjectPool.getFromPool d4MPool d4Mp (fun _ -> d4MUnion.createConstant p)
 
         t'.ReplaceIf p
-
-        match t'.A with
-        | Some A ->
-            let s,e = StreamPool.P
-            A.MemsetAsync(0uy,s.Stream) // Zeroes out the adjoints concurrently on the forward pass.
-            e.Record s.Stream
-            t'.adjoint_occupied.Add e
-        | None -> ()
-
+        t'.primal_occupied.Clear()
+        t'.adjoint_occupied.Clear()
+        t'.is_dead <- Undefined
+        if inference_only_flag = false then t'.setZeroAdjoint()
         t'
 
     member inline t.getd4M (is_constant, (n:int,c:int,h:int,w:int as p)) = t.getd4M (is_constant, [|p|])
@@ -378,7 +455,16 @@ type ObjectPool() =
             (fun _ -> new TensorDescriptor()) 
             (fun (t: TensorDescriptor) (nchw, mode, srcDesc) -> cudnn.DeriveBNTensorDescriptor(t,srcDesc,mode))
 
+    /// Resets the occupancy arrays of all the objects in the pool.
+    /// Blocks the device and also, triggers .NET GC because why not?
+    member inline t.ResetOccupancy() =
+        for i=0 to d4MPool.Count-1 do
+            d4MPool.[i].primal_occupied.Clear()
+            d4MPool.[i].adjoint_occupied.Clear()
+        GC.Collect() // This one might be unneeded.
+        ctx.Synchronize()
     /// Sets only the object pool pointers to zero.
+    /// Unlike in V2 of Spiral, in this version the adjoints are set to zero during the forward phase.
     member inline t.ResetPointers() =
         d4Mp := 0
         wp := 0
@@ -387,6 +473,10 @@ type ObjectPool() =
 let ObjectPool = new ObjectPool() // In the past iteration of the library, the object pool's role was taken by the tape. Not anymore.
 
 let tape = new Stack<(unit -> unit)>(1000) // Nice and simple way of passing in the closures for the backprop step.
+let backprop_tape() =
+    ObjectPool.ResetOccupancy() // This step is a good one to make here.
+    while tape.Count > 0 do
+        tape.Pop()()
 
 let inline divup a b = (a-1)/b+1 // Integer division with rounding up. (a+b-1)/b is another variant on this.
 
@@ -449,18 +539,12 @@ type DeviceUnaryTransformModule(op: string, unique_name : string) =
         if x_nchw <> o_nchw then failwith "x_nchw <> o_nchw in DeviceUnaryTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, x,o,n) |> ignore
 
-        e.Record s.Stream
-        o_occ.Add e
-
+        module_unary_stream_function x_occ o_occ
+        <| fun s -> kernel.RunAsync(s, x,o,n)
 
 /// o <- f(x,y)
 type DeviceBinaryTransformModule(op: string, unique_name) = 
@@ -499,18 +583,12 @@ type DeviceBinaryTransformModule(op: string, unique_name) =
         if y_nchw <> o_nchw then failwith "y_nchw <> o_nchw in DeviceBinaryTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s y_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, x,y,o,n) |> ignore
+        module_binary_stream_function x_occ y_occ o_occ
+        <| fun s -> kernel.RunAsync(s, x,y,o,n)
 
-        e.Record s.Stream
-        o_occ.Add e
 
 /// o <- f(x,y,z)
 type DeviceTrinaryTransformModule(op: string, unique_name) = 
@@ -550,19 +628,12 @@ type DeviceTrinaryTransformModule(op: string, unique_name) =
         if z_nchw <> o_nchw then failwith "z_nchw <> o_nchw in DeviceTrinaryTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s y_occ
-        wait_on_event s z_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, x,y,z,o,n) |> ignore
+        module_trinary_stream_function x_occ y_occ z_occ o_occ
+        <| fun s -> kernel.RunAsync(s, x,y,z,o,n)
 
-        e.Record s.Stream
-        o_occ.Add e
 
 /// o <- sum(f(x))
 type DeviceUnaryMapSumModule(op: string, unique_name) = 
@@ -627,8 +698,8 @@ type DeviceUnaryMapSumModule(op: string, unique_name) =
 
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, x,o.DevicePointer,n) |> ignore
-        o.[SizeT 0]
+        kernel.RunAsync(s.Stream, x,o.DevicePointer,n)
+        lazy o.[SizeT 0]
 
 /// o <- sum(f(x,y))
 type DeviceBinaryMapSumModule(op: string, unique_name) = 
@@ -693,8 +764,8 @@ type DeviceBinaryMapSumModule(op: string, unique_name) =
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, x,y,o.DevicePointer,n) |> ignore
-        o.[SizeT 0]
+        kernel.RunAsync(s.Stream, x,y,o.DevicePointer,n)
+        lazy o.[SizeT 0]
 
 /// o <- f(coef_x,x)
 type DeviceUnaryCoefTransformModule(op: string, unique_name) = 
@@ -747,17 +818,12 @@ type DeviceUnaryCoefTransformModule(op: string, unique_name) =
         if x_nchw <> o_nchw then failwith "x.nchw <> o.nchw in DeviceUnaryCoefTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, coef_x,x,o,n) |> ignore
+        module_unary_stream_function x_occ o_occ
+        <| fun s -> kernel.RunAsync(s, coef_x,x,o,n)
 
-        e.Record s.Stream
-        o_occ.Add e
 
 /// o <- f(coef_x,x,coef_y,y)
 type DeviceBinaryCoefTransformModule(op: string, unique_name) = 
@@ -812,18 +878,12 @@ type DeviceBinaryCoefTransformModule(op: string, unique_name) =
         if y_nchw <> o_nchw then failwith "y_nchw <> o_nchw in DeviceBinaryCoefTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s y_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, coef_x,x,coef_y,y,o,n) |> ignore
+        module_binary_stream_function x_occ y_occ o_occ
+        <| fun s -> kernel.RunAsync(s, coef_x,x,coef_y,y,o,n)
 
-        e.Record s.Stream
-        o_occ.Add e
 
 /// o <- f(coef_x,x,coef_y,y,coef_z,z)
 type DeviceTrinaryCoefTransformModule(op: string, unique_name) = 
@@ -878,19 +938,12 @@ type DeviceTrinaryCoefTransformModule(op: string, unique_name) =
         if z_nchw <> o_nchw then failwith "z_nchw <> o_nchw in DeviceTrinaryCoefTransformModule"
         let n = size_nchw x_nchw
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s y_occ
-        wait_on_event s z_occ
-        wait_on_event s o_occ
-
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
         kernel.GridDimensions <- dim3(gridSize)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream, coef_x,x,coef_y,y,coef_z,z,o,n) |> ignore
+        module_trinary_stream_function x_occ y_occ z_occ o_occ
+        <| fun s -> kernel.RunAsync(s, coef_x,x,coef_y,y,coef_z,z,o,n)
 
-        e.Record s.Stream
-        o_occ.Add e
 
 /// o <- max_col(x)
 /// Sets all except one of the max of a column to zero.
@@ -963,16 +1016,13 @@ type DeviceMaxColumnActivationModule() =
         if x_nchw <> o_nchw then failwith "x_nchw <> o_nchw"
         let m = c*h*w
 
-        let s,e = StreamPool.P
-        wait_on_event s x_occ
-        wait_on_event s o_occ
-
         kernel.GridDimensions <- dim3(n)
         kernel.BlockDimensions <- dim3(block_size)
-        kernel.RunAsync(str.Stream,x,o,m,n) |> ignore
 
-        e.Record s.Stream
-        o_occ.Add e
+        module_unary_stream_function x_occ o_occ
+        <| fun s -> kernel.RunAsync(s,x,o,m,n)
+
+
       
 // The gradient clipping module.
 let gradclipModule = lazy DeviceUnaryCoefTransformModule("(x < -coef_x) ? -coef_x : (x > coef_x ? coef_x : x);", "GradClip") // Unique names like GradClip are necessary for load and saving to drive. Be very careful of collisions.
@@ -984,12 +1034,13 @@ let randMapModule = lazy DeviceBinaryCoefTransformModule("coef_x*(x-0.5f)+coef_y
 
 /// Fills matrix by sampling from a random uniform distribution in <-1.0f,1.0f]
 let fillRandomUniformMatrix (x_nchw, x : CUdeviceptr, x_occ as x') (scaling_factor : float32) location =
-    use x'' = ptr_to_device_variable x_nchw x
     
     let s,e = StreamPool.P
-    wait_on_event s x_occ
     cudaRandom.SetStream s.Stream
 
+    wait_on_event s x_occ
+
+    use x'' = ptr_to_device_variable x_nchw x
     cudaRandom.GenerateUniform(x'')
 
     e.Record s.Stream
@@ -998,22 +1049,41 @@ let fillRandomUniformMatrix (x_nchw, x : CUdeviceptr, x_occ as x') (scaling_fact
     // 2.0f*scaling_factor ensures that it is rescaled around zero if the scaling_factor is 1.0f.
     randMapModule.Value.A(2.0f*scaling_factor,x',location,x',x')
 
+let inline private cublas_unary_stream_function input_occ output_occ (f : unit -> unit) =
+    let s,e = StreamPool.P
+    cublas.Stream <- s.Stream
+    
+    wait_on_event s input_occ
+    wait_on_event s output_occ
+
+    f()
+
+    e.Record s.Stream
+    output_occ.Add e
+
+let inline private cublas_binary_stream_function left_occ right_occ output_occ (f : unit -> unit) =
+    let s,e = StreamPool.P
+    cublas.Stream <- s.Stream
+    
+    wait_on_event s left_occ
+    wait_on_event s right_occ
+    wait_on_event s output_occ
+
+    f()
+
+    e.Record s.Stream
+    output_occ.Add e
+
 // y <- alpha * x + y
 let saxpy (alpha:float32) (x_nchw, x : CUdeviceptr, x_occ) (y_nchw, y:CUdeviceptr, y_occ) =
     if x_nchw <> y_nchw then failwith "x_nchw <> y_nchw in saxpy"
-    
+
     use x = ptr_to_device_variable x_nchw x
     use y = ptr_to_device_variable y_nchw y
 
-    let s,e = StreamPool.P
-    wait_on_event s x_occ
-    wait_on_event s y_occ
-    cublas.Stream <- str.Stream
+    cublas_unary_stream_function x_occ y_occ
+    <| fun _ -> cublas.Axpy(alpha,x,1,y,1)
 
-    cublas.Axpy(alpha,x,1,y,1)
-
-    e.Record s.Stream
-    y_occ.Add e
 
 /// General matrix-matrix addition. Inplace version.
 /// The function is not indented for transposes due to dimensional confusion.
@@ -1035,21 +1105,12 @@ let geam transa transb (alpha: float32) ((A_num_images, A_num_channels, A_num_ro
         let ldb = if transa = nT then b_row else b_col
         let ldc = a_row
 
-        use A = ptr_to_device_variable A_nchw A
-        use B = ptr_to_device_variable B_nchw B
-        use C = ptr_to_device_variable C_nchw C
+        use A = new CudaDeviceVariable<float32>(A,false,sizeof<float32> * A_num_rows * A_num_cols |> SizeT)
+        use B = new CudaDeviceVariable<float32>(B,false,sizeof<float32> * B_num_rows * B_num_cols |> SizeT)
+        use C = new CudaDeviceVariable<float32>(C,false,sizeof<float32> * C_num_rows * C_num_cols |> SizeT)
 
-        let s,e = StreamPool.P
-        wait_on_event s A_occ
-        wait_on_event s B_occ
-        wait_on_event s C_occ
-
-        cublas.Stream <- str.Stream
-
-        cublas.Geam(transa, transb, a_row, a_col, alpha, A, lda, B, ldb, beta, C, ldc)
-
-        e.Record s.Stream
-        C_occ.Add e
+        cublas_binary_stream_function A_occ B_occ C_occ
+        <| fun _ -> cublas.Geam(transa, transb, a_row, a_col, alpha, A, lda, B, ldb, beta, C, ldc)
 
     geam (A_num_channels*A_num_cols*A_num_rows,A_num_images) (B_num_channels*B_num_cols*B_num_rows,B_num_images) (C_num_channels*C_num_cols*C_num_rows,C_num_images)
 
@@ -1069,31 +1130,35 @@ let gemm transa transb (alpha: float32) ((A_num_images, A_num_channels, A_num_ro
 
         if m <> C_num_rows || n <> C_num_cols then failwithf "m(%i) <> C_num_rows(%i) || n(%i) <> C_num_cols(%i)" m C_num_rows n C_num_cols
 
-        let s,e = StreamPool.P
-        cublas.Stream <- str.Stream
-
-        wait_on_event str A_occ
-        wait_on_event str B_occ
-        wait_on_event str C_occ
-
         use A = new CudaDeviceVariable<float32>(A,false,sizeof<float32> * A_num_rows * A_num_cols |> SizeT)
         use B = new CudaDeviceVariable<float32>(B,false,sizeof<float32> * B_num_rows * B_num_cols |> SizeT)
         use C = new CudaDeviceVariable<float32>(C,false,sizeof<float32> * C_num_rows * C_num_cols |> SizeT)
-        cublas.Gemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
 
-        e.Record s.Stream
-        C_occ.Add e
+        cublas_binary_stream_function A_occ B_occ C_occ
+        <| fun _ -> cublas.Gemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+
     gemm (A_num_channels*A_num_cols*A_num_rows,A_num_images) (B_num_channels*B_num_cols*B_num_rows,B_num_images) (C_num_channels*C_num_cols*C_num_rows,C_num_images)
 
+/// Does not only check, but also sets the undefined nodes to Dead or Alive.
+let inline deadness_check (c : d4MUnion) (a : d4MUnion) (f : unit -> unit) =
+    match c.is_dead with
+    | Undefined -> failwith "The upper node should not be undefined."
+    | Dead -> 
+        match a.is_dead with
+        | Undefined -> a.is_dead <- Dead
+        | Dead | Alive -> () // If the bottom node is Alive do not modify it to be Dead as there exists a path from elsewhere through it.
+    | Alive -> 
+        f()
+        a.is_dead <- Alive
 
 /// Matrix-matrix multiply.
-let inline private matmult' (prev_output : d4M option) ((a,b): d4M*d4M) =
+let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4MUnion) =
     let c = 
         match prev_output with
         | None ->
-            let num_rows = a.num_channels*a.num_cols*a.num_rows
-            let num_cols = b.num_images
-            ObjectPool.getd4M false (num_cols,num_rows,1,1)
+            let num_rows,_ = a.rc
+            let _,num_cols = b.rc
+            ObjectPool.getd4M (false, (num_cols,num_rows,1,1))
             |> fun c ->
                 gemm nT nT 1.0f a.P' b.P' 0.0f c.P'
                 c
@@ -1102,48 +1167,87 @@ let inline private matmult' (prev_output : d4M option) ((a,b): d4M*d4M) =
             c
 
     if a.A.IsSome then 
-        let matmult_backward_left () = gemm nT T 1.0f c.A' b.P' 1.0f a.A'
+        let matmult_backward_left () = 
+            deadness_check c a <| fun _ -> gemm nT T 1.0f c.A' b.P' 1.0f a.A'
+
         tape.Push(matmult_backward_left)
     if b.A.IsSome then 
-        let matmult_backward_right () = gemm T nT 1.0f a.P' c.A' 1.0f b.A'
+        let matmult_backward_right () = 
+            deadness_check c b <| fun _ -> gemm T nT 1.0f a.P' c.A' 1.0f b.A'
         tape.Push(matmult_backward_right)
     Some c
 
-let matmult (a: d4M) (b:d4M) = matmult' None (a, b) |> fun x -> x.Value
+let matmult (a: d4MUnion) (b:d4MUnion) = matmult' None (a, b) |> fun x -> x.Value
+
+let inline private cudnn_unary_stream_function input_occ output_occ (f : unit -> unit) =
+    let s,e = StreamPool.P
+    cudnn.SetStream(s)
+    
+    wait_on_event s input_occ
+    wait_on_event s output_occ
+
+    f()
+
+    e.Record s.Stream
+    output_occ.Add e
+
+let inline private cudnn_binary_stream_function left_occ right_occ output_occ (f : unit -> unit) =
+    let s,e = StreamPool.P
+    cudnn.SetStream(s)
+    
+    wait_on_event s left_occ
+    wait_on_event s right_occ
+    wait_on_event s output_occ
+
+    f()
+
+    e.Record s.Stream
+    output_occ.Add e
 
 /// Can be used to add matrices or for (4D)matrix-vector broadcast addition.
 /// The output dimensions are based on the left argument.
 /// Those dimenions the size of 1 of the right argument are broadcasted.
-let inline private tensor_add' add_to_left alpha (left : d4M) beta (right : d4M) =
-    let leftDesc = ObjectPool.getTensorDescriptor left.nchw
-    let rightDesc = ObjectPool.getTensorDescriptor right.nchw
+let inline private tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnion) =
+    let left_nchw = left.nchw
+    let right_nchw = right.nchw
+    let leftDesc = ObjectPool.getTensorDescriptor left_nchw
+    let rightDesc = ObjectPool.getTensorDescriptor right_nchw
 
     let output = 
         if add_to_left = false 
         then 
-            left.nchw |> ObjectPool.getd4M false 
-            |> fun output -> cudnn.AddTensor(alpha,leftDesc,left.P,0.0f,leftDesc,output.P); output // Copy the left to output
+            ObjectPool.getd4M (false, left_nchw) 
+            |> fun output -> 
+                geam nT nT alpha left.P' 0.0f output.P' output.P'
+                output
         else 
             left
 
-    cudnn.AddTensor(beta,rightDesc,right.P,1.0f,leftDesc,output.P) // Add right to output.
+    if left_nchw <> right_nchw then
+        cudnn_unary_stream_function right.primal_occupied output.primal_occupied 
+        <| fun _ -> cudnn.AddTensor(beta,rightDesc,right.P,1.0f,leftDesc,output.P) // Add right to output.
+    else geam nT nT beta right.P' 1.0f output.P' output.P'
 
     if right.A.IsSome then 
-        let tensor_add_right_backwards () = 
-            if left.nchw = right.nchw then
-                saxpy beta output.A' right.A'
-            else
-                cudnn.ConvolutionBackwardBias(beta,leftDesc,output.A.Value,1.0f,rightDesc,right.A.Value)
+        let tensor_add_right_backwards () =
+            deadness_check output right
+            <| fun _ ->
+                if left_nchw = right_nchw then
+                    saxpy beta output.A' right.A'
+                else
+                    cudnn_unary_stream_function output.adjoint_occupied right.adjoint_occupied
+                    <| fun _ -> cudnn.ConvolutionBackwardBias(beta,leftDesc,output.A.Value,1.0f,rightDesc,right.A.Value)
         tape.Push(tensor_add_right_backwards)
 
-    if add_to_left = false && left.A.IsSome then 
-        let tensor_add_left_backwards () = saxpy alpha output.A' left.A'
+    if add_to_left = false && left.A.IsSome then // No point in adding the adjoint to itself.
+        let tensor_add_left_backwards () = 
+            deadness_check output left <| fun _ -> saxpy alpha output.A' left.A'
         tape.Push(tensor_add_left_backwards)
     output
 
 let tensor_add = tensor_add' false
 
-let linear_layer_matmult (mm: (d4M*d4M) []) (bias: d4M option) =
+let linear_layer_matmult (mm: (d4MUnion*d4MUnion) []) (bias: d4MUnion option) =
     mm
     |> Array.fold matmult' None
     |> fun (output) ->
@@ -1153,46 +1257,50 @@ let linear_layer_matmult (mm: (d4M*d4M) []) (bias: d4M option) =
         | Some right -> tensor_add' true 1.0f left 1.0f right
 
 /// The activation function. Zeroes out the target primal during the call.
-let activation_forward mode (input : d4M)  =
+let activation_forward mode (input : d4MUnion)  =
     let input_sizes = input.nchw
     let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
 
-    let alpha = 1.0f
-    let beta = 1.0f
+    let output = ObjectPool.getd4M (false, input_sizes)
 
-    let output = ObjectPool.getd4M false input_sizes
-
-    cudnn.ActivationForward(mode,alpha,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
+    cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+    <| fun _ -> cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
 
     if input.A.IsSome then 
         let activation_backward () =
-            cudnn.ActivationBackward(mode,alpha,srcTensorDesc,output.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.P,beta,srcTensorDesc,input.A.Value)
+            deadness_check output input 
+            <| fun _ -> 
+                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                <| fun _ -> cudnn.ActivationBackward(mode,1.0f,srcTensorDesc,output.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.P,1.0f,srcTensorDesc,input.A.Value)
         tape.Push(activation_backward)
     output
 
 /// The pooling function. Zeroes out the target primal during the call.
-let pooling_forward p (input : d4M) =
+let pooling_forward p (input : d4MUnion) =
     let poolingDescriptor = ObjectPool.getPoolingDescriptor p
     let input_sizes = input.nchw
     let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
     let dest_sizes = poolingDescriptor.GetPooling2dForwardOutputDim srcTensorDesc
 
-    let output = ObjectPool.getd4M false dest_sizes
+    let output = ObjectPool.getd4M(false, dest_sizes)
 
     let dstTensorDesc = ObjectPool.getTensorDescriptor dest_sizes
 
-    let alpha, beta = 1.0f, 1.0f
-
-    cudnn.PoolingForward(poolingDescriptor,alpha,srcTensorDesc,input.P,0.0f,dstTensorDesc,output.P)
+    cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+    <| fun _ -> cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,input.P,0.0f,dstTensorDesc,output.P)
 
     if input.A.IsSome then 
         let pooling_backward () =
-            cudnn.PoolingBackward(poolingDescriptor,alpha,srcTensorDesc,output.P,srcTensorDesc,
-                                  output.A.Value,dstTensorDesc,input.P,beta,dstTensorDesc,input.A.Value)
+            deadness_check output input 
+            <| fun _ ->
+                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                <| fun _ -> cudnn.PoolingBackward(poolingDescriptor,1.0f,srcTensorDesc,output.P,srcTensorDesc,
+                                      output.A.Value,dstTensorDesc,input.P,1.0f,dstTensorDesc,input.A.Value)
         tape.Push(pooling_backward)
     output
 
-let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4M) option) (convPar, data : d4M, filter : d4M) =
+
+let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUnion) option) (convPar, data : d4MUnion, filter : d4MUnion) =
     let data_sizes = data.nchw
     let filter_sizes = filter.nchw
 
@@ -1208,7 +1316,7 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4M) 
             if dims <> prev_dims then failwith "dims <> prev_dims in linear_layer_conv"
             prev_dims, prev_output
         | None ->
-            dims, dims |> ObjectPool.getd4M false
+            dims, ObjectPool.getd4M (false, dims)
 
     let dstTensorDesc = ObjectPool.getTensorDescriptor dims
 
@@ -1217,12 +1325,12 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4M) 
         cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) |> int
         |> ObjectPool.getWorkspace
 
-    let alpha = 1.0f
-    let beta = 1.0f // This thing could be dangerous.
-
-    match prev_output with
-    | None -> cudnn.ConvolutionForward(alpha,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,0.0f,dstTensorDesc,output.P)
-    | Some _ -> cudnn.ConvolutionForward(alpha,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,1.0f,dstTensorDesc,output.P) // Don't zero out the previous output.
+    let beta = 
+        match prev_output with
+        | None -> 0.0f
+        | Some _ -> 1.0f
+    cudnn_binary_stream_function data.primal_occupied filter.primal_occupied output.primal_occupied
+    <| fun _ -> cudnn.ConvolutionForward(1.0f,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,beta,dstTensorDesc,output.P) // Don't zero out the previous output.
 
     if filter.A.IsSome then 
         let convolution_backwards_filter () =
@@ -1230,7 +1338,10 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4M) 
             let workspace =
                 cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) |> int
                 |> ObjectPool.getWorkspace
-            cudnn.ConvolutionBackwardFilter(alpha,srcTensorDesc,data.P,dstTensorDesc,output.A.Value,convDesc,algo,workspace,beta,filterDesc,filter.A.Value)
+            deadness_check output filter 
+            <| fun _ ->
+                cudnn_unary_stream_function output.adjoint_occupied filter.adjoint_occupied
+                <| fun _ -> cudnn.ConvolutionBackwardFilter(1.0f,srcTensorDesc,data.P,dstTensorDesc,output.A.Value,convDesc,algo,workspace,1.0f,filterDesc,filter.A.Value)
         tape.Push(convolution_backwards_filter)
 
     if data.A.IsSome then 
@@ -1239,17 +1350,20 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4M) 
             let workspace =
                 cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) |> int
                 |> ObjectPool.getWorkspace
-            cudnn.ConvolutionBackwardData(alpha,filterDesc,filter.P,dstTensorDesc,output.A.Value,convDesc,beta,algo,workspace,srcTensorDesc,data.A.Value)
+            deadness_check output data 
+            <| fun _ ->
+                cudnn_unary_stream_function output.adjoint_occupied filter.adjoint_occupied
+                <| fun _ -> cudnn.ConvolutionBackwardData(1.0f,filterDesc,filter.P,dstTensorDesc,output.A.Value,convDesc,1.0f,algo,workspace,srcTensorDesc,data.A.Value)
         tape.Push(convolution_backwards_data)
 
     (dims,output) |> Some
 
 /// The convolutional function. Zeroes out the target primal during the call.
-let convolution_forward convPar (data : d4M) (filter : d4M) = 
+let convolution_forward convPar (data : d4MUnion) (filter : d4MUnion) = 
     convolutional_forward' None (convPar,data,filter)
     |> fun x -> x.Value |> snd
 
-let batch_normalization_forward bnMode (bnScale : d4M) (bnBias : d4M) (bnRunningMean : d4M) (bnRunningVariance : d4M) exponentialAverageFactor do_inference (input : d4M) =
+let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) (bnRunningMean : d4MUnion) (bnRunningVariance : d4MUnion) exponentialAverageFactor do_inference (input : d4MUnion) =
     let input_sizes = input.nchw
     let bias_sizes = bnBias.nchw
     let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
@@ -1269,26 +1383,31 @@ let batch_normalization_forward bnMode (bnScale : d4M) (bnBias : d4M) (bnRunning
 
     let alpha, beta = 1.0f, 0.0f
     let epsilon = 1e-5
-    let bnSavedMean = bias_sizes |> ObjectPool.getd4M true
-    let bnSavedVariance = bias_sizes |> ObjectPool.getd4M true
-    let output = input_sizes |> ObjectPool.getd4M false
+    let bnSavedMean = ObjectPool.getd4M (true,bias_sizes)
+    let bnSavedVariance = ObjectPool.getd4M (true,bias_sizes)
+    let output = ObjectPool.getd4M (false,input_sizes)
 
     if do_inference = false then
-        cudnn.BatchNormalizationForwardTraining(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,exponentialAverageFactor,bnRunningMean.P,bnRunningVariance.P,epsilon,bnSavedMean.P,bnSavedVariance.P)
+        cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+        <| fun _ -> cudnn.BatchNormalizationForwardTraining(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,exponentialAverageFactor,bnRunningMean.P,bnRunningVariance.P,epsilon,bnSavedMean.P,bnSavedVariance.P)
         if input.A.IsSome then 
             let batch_normalization_backward () =
                 let dx_alpha, dx_beta = 1.0f, 1.0f
                 let param_alpha, param_beta = 1.0f, 1.0f
 
-                cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
+                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                <| fun _ -> cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
                 
             tape.Push batch_normalization_backward
     else
-        cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
+        deadness_check output input 
+        <| fun _ ->
+            cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+            <| fun _ -> cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
         
     output
     
-let linear_layer_conv (convs: (ConvolutionParameters*d4M*d4M) []) (bias: d4M option) =
+let linear_layer_conv (convs: (ConvolutionParameters*d4MUnion*d4MUnion) []) (bias: d4MUnion option) =
     convs
     |> Array.fold convolutional_forward' None
     |> fun (output) ->
@@ -1300,36 +1419,44 @@ let linear_layer_conv (convs: (ConvolutionParameters*d4M*d4M) []) (bias: d4M opt
 let hadamaradMultiplicationModule = lazy new DeviceBinaryTransformModule("x*y;", "HadMult")
 let hadamaradMultiplicationErrorModule = lazy new DeviceTrinaryTransformModule("x*y+z;", "HadMultError")
 /// Hadamarad (elementwise) multiplication function.
-let inline private hadmult' (prev_output : d4M option) ((a,b): d4M*d4M) =
+let inline private hadmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4MUnion) =
     let c = 
         match prev_output with
         | Some c -> 
             hadamaradMultiplicationErrorModule.Value.A(a.P', b.P', c.P', c.P'); c
         | None -> 
-            ObjectPool.getd4M false a.nchw
+            ObjectPool.getd4M (false, a.nchw)
             |> fun c -> hadamaradMultiplicationModule.Value.A(a.P', b.P', c.P'); c
 
     if a.A.IsSome then 
-        let hadmult_backward_left () = hadamaradMultiplicationErrorModule.Value.A(b.P',c.A',a.A',a.A')
+        let hadmult_backward_left () = 
+            deadness_check c a 
+            <| fun _ ->
+                hadamaradMultiplicationErrorModule.Value.A(b.P',c.A',a.A',a.A')
         tape.Push hadmult_backward_left
     if b.A.IsSome then 
-        let hadmult_backward_right () = hadamaradMultiplicationErrorModule.Value.A(a.P',c.A',b.A',b.A')
+        let hadmult_backward_right () = 
+            deadness_check c b 
+            <| fun _ ->
+                hadamaradMultiplicationErrorModule.Value.A(a.P',c.A',b.A',b.A')
         tape.Push hadmult_backward_right
     Some c
 
-let hadmult (a: d4M) (b: d4M) = hadmult' None (a, b) |> fun x -> x.Value
-let linear_layer_hadmult (hads: (d4M*d4M)[]) = hads |> Array.fold hadmult' None |> fun x -> x.Value
+let hadmult (a: d4MUnion) (b: d4MUnion) = hadmult' None (a, b) |> fun x -> x.Value
+let linear_layer_hadmult (hads: (d4MUnion*d4MUnion)[]) = hads |> Array.fold hadmult' None |> fun x -> x.Value
 
 let squareModule = lazy new DeviceUnaryTransformModule("x*x;","Square")
 //y = error
 //z = previous adjoint value
 let squareErrorModule = lazy new DeviceTrinaryTransformModule("2.0f*x*y + z;","SquareError")
-let square (a:d4M) =
-    let c = a.nchw |> ObjectPool.getd4M false
+let square (a:d4MUnion) =
+    let c = ObjectPool.getd4M (false,a.nchw)
     squareModule.Value.A(a.P',c.P')
 
     if a.A.IsSome then 
-        let square_backward () = squareErrorModule.Value.A(a.P',c.A',a.A',a.A')
+        let square_backward () = 
+            deadness_check c a 
+            <| fun _ -> squareErrorModule.Value.A(a.P',c.A',a.A',a.A')
         tape.Push square_backward
     c
 
@@ -1338,27 +1465,31 @@ let squareSumModule = lazy new DeviceUnaryMapSumModule("x*x;", "SquareSum")
 
 let sumModule = lazy new DeviceUnaryMapSumModule("x;", "Sum")
 let sumErrorModule = lazy new DeviceUnaryCoefTransformModule("coef_x + x;", "SumError")
-let sum (a:d4M) =
-    let c = Df.create (ref 0.0f)
+let sum (a:d4MUnion) =
+    let c = Df.create 0.0f
     c.P := sumModule.Value.A(a.P')
 
     if a.A.IsSome then 
-        let sum_backward () = sumErrorModule.Value.A(!c.A,a.A',a.A')
+        let sum_backward () = 
+            if !c.A <> 0.0f then 
+                a.is_dead <- Alive
+                sumErrorModule.Value.A(!c.A,a.A',a.A')
+            else a.is_dead <- Dead
         tape.Push sum_backward
     c
 
 let scale (alpha: float32) (a:Df) =
-    let c = Df.create (ref 0.0f)
-    c.P := alpha * !a.P
+    let c = Df.create 0.0f
+    c.P := lazy (alpha * a.P.Value.Value)
 
     let scale_backward () = a.A := alpha * !c.A + !a.A
     tape.Push scale_backward
     c
 
 let sum_scalars (a:Df[]) =
-    let c = Df.create (ref 0.0f)
+    let c = Df.create 0.0f
 
-    for l in a do c.P := !c.P + !l.P
+    for l in a do c.P := lazy (c.P.Value.Value + l.P.Value.Value)
     
     let sum_scalars_backwards () = for l in a do l.A := !c.A + !l.A
     tape.Push sum_scalars_backwards
@@ -1368,13 +1499,15 @@ let logModule = lazy new DeviceUnaryTransformModule("logf(x);","Log")
 //y=error
 //z=previous adjoint
 let logErrorModule = lazy new DeviceTrinaryTransformModule("y / x + z;","LogError")
-let log_ (a:d4M) =
-    let c = ObjectPool.getd4M false a.nchw
+let log_ (a:d4MUnion) =
+    let c = ObjectPool.getd4M (false, a.nchw)
 
     logModule.Value.A(a.P',c.P')
 
     if a.A.IsSome then
-        let log_backward () = logErrorModule.Value.A(a.P',c.A', a.A', a.A')
+        let log_backward () = 
+            deadness_check c a 
+            <| fun _ -> logErrorModule.Value.A(a.P',c.A', a.A', a.A')
         tape.Push log_backward
     c
 
@@ -1382,8 +1515,8 @@ let log_ (a:d4M) =
 //coef_y = coef
 let scalarMatrixAddModule = lazy new DeviceBinaryCoefTransformModule("coef_x + coef_y*x;","ScalarMatrixAdd")
 /// o <- scalar + coef*a
-let scalar_matrix_add scalar coef (a:d4M) =
-    let c = ObjectPool.getd4M false a.nchw
+let scalar_matrix_add scalar coef (a:d4MUnion) =
+    let c = ObjectPool.getd4M (false, a.nchw)
 
     scalarMatrixAddModule.Value.A(scalar,a.P',coef,a.P',c.P')
 
@@ -1393,8 +1526,8 @@ let scalar_matrix_add scalar coef (a:d4M) =
     c
 
 
-let add alpha (a: d4M) beta (b: d4M) =
-    let c = ObjectPool.getd4M false a.nchw
+let add alpha (a: d4MUnion) beta (b: d4MUnion) =
+    let c = ObjectPool.getd4M (false, a.nchw)
 
     geam nT nT alpha a.P' beta b.P' c.P'
 
@@ -1406,11 +1539,11 @@ let add alpha (a: d4M) beta (b: d4M) =
         tape.Push add_backward_right
     c
 
-let softmax_instance_forward (data : d4M) =
+let softmax_instance_forward (data : d4MUnion) =
     let data_sizes = data.nchw
 
     let srcTensorDesc = ObjectPool.getTensorDescriptor data_sizes
-    let output = data_sizes |> ObjectPool.getd4M false 
+    let output =  ObjectPool.getd4M (false, data_sizes)
 
     let algo = cudnnSoftmaxAlgorithm.Accurate // Log mode forgets to re-exponentiate at the end.
     let mode = cudnnSoftmaxMode.Instance
@@ -1430,8 +1563,8 @@ let clipErrorModule = lazy new DeviceTrinaryCoefTransformModule("y*((x < coef_x)
 /// o <- clip(min,max,a)+scalar
 /// The clip function. Can be used as Relu by setting max to positive infinity. 
 /// Can be used to make linear clipped sigmoid by setting min,max,scalar to -0.5f,0.5f,0.5f.
-let clip min max (a : d4M) scalar =
-    let c = ObjectPool.getd4M false a.nchw
+let clip min max (a : d4MUnion) scalar =
+    let c = ObjectPool.getd4M (false, a.nchw)
 
     clipModule.Value.A(min,a.P',max,a.P',scalar,a.P',c.P')
 
@@ -1457,18 +1590,18 @@ let squared_error_cost target activations =
     add 1.0f target -1.0f activations // TODO: tensor_add is ungodly slow in v3. Make v4 wrapper.
     |> square
     |> sum
-    |> scale (0.5f/ float32 target.num_images)
+    |> scale (0.5f/ float32 (target.nchw |> fun (num_images,_,_,_) -> num_images))
 
 let cross_entropy_cost target activations =
     linear_layer_hadmult [|target,log_ activations;scalar_matrix_add 1.0f -1.0f target, log_ (scalar_matrix_add 1.0f -1.0f activations)|]
     |> sum
-    |> scale (-1.0f/float32 target.num_images)
+    |> scale (-1.0f/float32 (target.nchw |> fun (num_images,_,_,_) -> num_images))
 
 
 let maxColumnActivationModule = lazy new DeviceMaxColumnActivationModule()
 let accuracyModule = lazy new DeviceBinaryMapSumModule("(x*y == 0.0f) ? 0.0f : 1.0f;","Accuracy")
-let get_accuracy (targets : d4M) (activations : d4M) =
-    let o = ObjectPool.getd4M true targets.nchw
+let get_accuracy (targets : d4MUnion) (activations : d4MUnion) =
+    let o = ObjectPool.getd4M (true, targets.nchw)
     maxColumnActivationModule.Value.A(activations.P',o.P')
     accuracyModule.Value.A(targets.P',o.P')
 
@@ -1480,22 +1613,22 @@ let find_max_index (action_values : float32[]) =
         if max < x then max <- x; index <- i
     index
 
-type d4M with
+type d4MUnion with
     static member makeUniformRandomNode (n,c,h,w as nchw) =
         let scale = (2.0f / sqrt(add_nchw nchw |> float32))
-        let p = d4M.create(n,c,h,w)
+        let p = d4MUnion.create((n,c,h,w))
         fillRandomUniformMatrix p.P' scale 0.0f
         p
 
 // A convolutional feedforward layer of neurons
 type ConvolutionalFeedforwardLayer =
     {
-    W : d4M  // Input weight matrix
-    b : d4M  // Bias vector
-    a : d4M -> d4M // Activation function
+    W : d4MUnion  // Input weight matrix
+    b : d4MUnion  // Bias vector
+    a : d4MUnion -> d4MUnion // Activation function
     }      
      
-    static member fromArray (a : d4M[]) act =
+    static member fromArray (a : d4MUnion[]) act =
         {
          W = a.[0]
          b = a.[1]
@@ -1504,12 +1637,12 @@ type ConvolutionalFeedforwardLayer =
 
     static member createRandomLayer (n,c,h,w as nchw) act =
         {
-         W = d4M.makeUniformRandomNode nchw
-         b = d4M.makeUniformRandomNode (1,n,1,1)
+         W = d4MUnion.makeUniformRandomNode nchw
+         b = d4MUnion.makeUniformRandomNode (1,n,1,1)
          a = act
         } 
 
-    member l.runLayer (convPars,x:d4M) =
+    member l.runLayer (convPars,x:d4MUnion) =
         linear_layer_conv [|convPars,x,l.W|] (Some l.b)
         |> l.a
 
@@ -1521,21 +1654,21 @@ type ConvolutionalFeedforwardLayer =
 type INNet =
       abstract member ResetAdjoints : unit -> unit
       abstract member SGD : learning_rate:float32 -> unit
-      abstract member ToArray : d4M []
-      abstract member inference : x:d4M -> d4M
-      abstract member runLayer : x:d4M -> d4M
-      abstract member train : x:d4M -> (unit -> float) -> d4M
+      abstract member ToArray : d4MUnion []
+      abstract member inference : x:d4MUnion -> d4MUnion
+      abstract member runLayer : x:d4MUnion -> d4MUnion
+      abstract member train : x:d4MUnion -> (unit -> float) -> d4MUnion
 
 // A fully connected feedforward layer of neurons
 //type FullyConnectedLayer = FeedforwardLayer
 type FeedforwardLayer =
     {
-    W : d4M  // Input weight matrix
-    b : d4M  // Bias vector
-    a : d4M -> d4M
+    W : d4MUnion  // Input weight matrix
+    b : d4MUnion  // Bias vector
+    a : d4MUnion -> d4MUnion
     } with     // Activation function
 
-    static member fromArray (a : d4M[]) act =
+    static member fromArray (a : d4MUnion[]) act =
         {
          W = a.[0]
          b = a.[1]
@@ -1544,21 +1677,21 @@ type FeedforwardLayer =
 
     static member createRandomLayer (n,c,h,w as nchw) act =
         {
-         W = d4M.makeUniformRandomNode nchw
-         b = d4M.makeUniformRandomNode (1,c,1,1)
+         W = d4MUnion.makeUniformRandomNode nchw
+         b = d4MUnion.makeUniformRandomNode (1,c,1,1)
          a = act
         } 
 
     static member inline create = FeedforwardLayer.createRandomLayer
 
     interface INNet with
-        member l.runLayer (x:d4M) =
+        member l.runLayer (x:d4MUnion) =
             linear_layer_matmult [|l.W,x|] (Some l.b) |> l.a
 
         /// This second attribute is supposed to be the exponential factor from the BN layer, but it is not used here.
-        member l.train (x: d4M) _ = (l :> INNet).runLayer x
+        member l.train (x: d4MUnion) _ = (l :> INNet).runLayer x
 
-        member l.inference (x: d4M) = (l :> INNet).runLayer x
+        member l.inference (x: d4MUnion) = (l :> INNet).runLayer x
 
         member l.ToArray = [|l.W;l.b|]
         member t.ResetAdjoints () = t.W.setZeroAdjoint(); t.b.setZeroAdjoint()
@@ -1566,15 +1699,15 @@ type FeedforwardLayer =
 
 type ResidualFeedforwardLayer =
     {
-    W1 : d4M  // Input weight matrix
-    b1 : d4M  // Bias vector
-    a1 : d4M -> d4M
-    W2 : d4M  // Input weight matrix
-    b2 : d4M  // Bias vector
-    a2 : d4M -> d4M
+    W1 : d4MUnion  // Input weight matrix
+    b1 : d4MUnion  // Bias vector
+    a1 : d4MUnion -> d4MUnion
+    W2 : d4MUnion  // Input weight matrix
+    b2 : d4MUnion  // Bias vector
+    a2 : d4MUnion -> d4MUnion
     } with     // Activation function
      
-    static member fromArray (a : d4M[]) act1 act2 =
+    static member fromArray (a : d4MUnion[]) act1 act2 =
         {
          W1 = a.[0]
          b1 = a.[1]
@@ -1586,26 +1719,26 @@ type ResidualFeedforwardLayer =
 
     static member createRandomLayer (n,c,h,w as nchw) act1 act2 =
         {
-         W1 = d4M.makeUniformRandomNode nchw
-         b1 = d4M.makeUniformRandomNode (1,c,1,1)
+         W1 = d4MUnion.makeUniformRandomNode nchw
+         b1 = d4MUnion.makeUniformRandomNode (1,c,1,1)
          a1 = act1
-         W2 = d4M.makeUniformRandomNode nchw
-         b2 = d4M.makeUniformRandomNode (1,c,1,1)
+         W2 = d4MUnion.makeUniformRandomNode nchw
+         b2 = d4MUnion.makeUniformRandomNode (1,c,1,1)
          a2 = act2
         } 
 
     static member inline create = ResidualFeedforwardLayer.createRandomLayer
 
     interface INNet with
-        member l.runLayer (x:d4M) =
+        member l.runLayer (x:d4MUnion) =
             linear_layer_matmult [|l.W1,x|] (Some l.b1) |> l.a1
             |> fun p -> linear_layer_matmult [|l.W2,p|] (Some l.b2)
             |> fun p -> add 1.0f p 1.0f x |> l.a2
         
         /// This second attribute is supposed to be the exponential factor from the BN layer, but it is not used here.
-        member l.train (x: d4M) _ = (l :> INNet).runLayer x
+        member l.train (x: d4MUnion) _ = (l :> INNet).runLayer x
 
-        member l.inference (x: d4M) = (l :> INNet).runLayer x
+        member l.inference (x: d4MUnion) = (l :> INNet).runLayer x
 
         member l.ToArray = [|l.W1;l.b1;l.W2;l.b2|]
         member t.ResetAdjoints () = t.W1.setZeroAdjoint(); t.b1.setZeroAdjoint(); t.W2.setZeroAdjoint(); t.b2.setZeroAdjoint()
@@ -1618,35 +1751,35 @@ type ResidualFeedforwardLayer =
 /// Can be used for feedforward nets assuming the last two dimensions are 1. Uses the spatial normalization mode.
 type BNConvolutionalLayer =
     {
-    W : d4M  // Input weight tensor
-    bnScale : d4M  // Scale tensor
-    bnBias : d4M  // Bias tensor
-    bnRunningMean : d4M  // Mean tensor
-    bnRunningVariance : d4M  // Variance tensor
-    a : d4M -> d4M // Activation function
+    W : d4MUnion  // Input weight tensor
+    bnScale : d4MUnion  // Scale tensor
+    bnBias : d4MUnion  // Bias tensor
+    bnRunningMean : d4MUnion  // Mean tensor
+    bnRunningVariance : d4MUnion  // Variance tensor
+    a : d4MUnion -> d4MUnion // Activation function
     }      
 
     static member create weight_nchw a =
-        let W = d4M.makeUniformRandomNode weight_nchw
+        let W = d4MUnion.makeUniformRandomNode weight_nchw
         let bias_sizes = weight_nchw |> fun (n,c,h,w) -> (1,n,1,1)
 
-        let bnScale = bias_sizes |> d4M.create 
+        let bnScale = bias_sizes |> d4MUnion.create 
         bnScale.setPrimal 0.1f // Initial scale value based on the Recurrent Batch Normalization paper by Cooijmans et al.
         bnScale.setZeroAdjoint()
-        let bnBias = bias_sizes |> d4M.create
+        let bnBias = bias_sizes |> d4MUnion.create
         bnBias.setZeroPrimal()
         bnBias.setZeroAdjoint()
-        let bnRunningMean = bias_sizes |> d4M.createConstant
-        let bnRunningVariance = bias_sizes |> d4M.createConstant
+        let bnRunningMean = bias_sizes |> d4MUnion.createConstant
+        let bnRunningVariance = bias_sizes |> d4MUnion.createConstant
 
         { W = W; bnScale = bnScale; bnBias = bnBias; bnRunningMean = bnRunningMean; bnRunningVariance = bnRunningVariance; a=a  }
 
-    member t.train (convPars,input:d4M) exponentialAverageFactor = 
+    member t.train (convPars,input:d4MUnion) exponentialAverageFactor = 
         let bnMode = cudnnBatchNormMode.BatchNormSpatial
         convolution_forward convPars input t.W
         |> batch_normalization_forward bnMode t.bnScale t.bnBias t.bnRunningMean t.bnRunningVariance exponentialAverageFactor false
         |> t.a
-    member t.inference (convPars,input:d4M) = 
+    member t.inference (convPars,input:d4MUnion) = 
         let bnMode = cudnnBatchNormMode.BatchNormSpatial
         convolution_forward convPars input t.W
         |> batch_normalization_forward bnMode t.bnScale t.bnBias t.bnRunningMean t.bnRunningVariance 1.0 true
@@ -1663,27 +1796,27 @@ type BNConvolutionalLayer =
 
 type BNFullyConnectedLayer =
     {
-    W : d4M  // Input weight tensor
-    bnScale : d4M  // Scale tensor
-    bnBias : d4M  // Bias tensor
-    bnRunningMean : d4M  // Mean tensor
-    bnRunningVariance : d4M  // Variance tensor
-    a : d4M -> d4M // Activation function
+    W : d4MUnion  // Input weight tensor
+    bnScale : d4MUnion  // Scale tensor
+    bnBias : d4MUnion  // Bias tensor
+    bnRunningMean : d4MUnion  // Mean tensor
+    bnRunningVariance : d4MUnion  // Variance tensor
+    a : d4MUnion -> d4MUnion // Activation function
     }      
 
     /// Creates a layer with random weights.
     static member create weight_nchw a =
-        let W = d4M.makeUniformRandomNode weight_nchw
+        let W = d4MUnion.makeUniformRandomNode weight_nchw
         let bias_sizes = weight_nchw |> fun (n,c,h,w) -> (1,c,1,1)
 
-        let bnScale = bias_sizes |> d4M.create 
+        let bnScale = bias_sizes |> d4MUnion.create 
         bnScale.setPrimal 0.1f // Initial scale value based on the Recurrent Batch Normalization paper by Cooijmans et al.
         bnScale.setZeroAdjoint()
-        let bnBias = bias_sizes |> d4M.create
+        let bnBias = bias_sizes |> d4MUnion.create
         bnBias.setZeroPrimal()
         bnBias.setZeroAdjoint()
-        let bnRunningMean = bias_sizes |> d4M.createConstant
-        let bnRunningVariance = bias_sizes |> d4M.createConstant
+        let bnRunningMean = bias_sizes |> d4MUnion.createConstant
+        let bnRunningVariance = bias_sizes |> d4MUnion.createConstant
 
         { W = W; bnScale = bnScale; bnBias = bnBias; bnRunningMean = bnRunningMean; bnRunningVariance = bnRunningVariance; a=a  }
 
@@ -1712,44 +1845,44 @@ type BNFullyConnectedLayer =
 
 type BNResidualFullyConnectedLayer =
     {
-    W1 : d4M  // Input weight tensor
-    bnScale1 : d4M  // Scale tensor
-    bnBias1 : d4M  // Bias tensor
-    bnRunningMean1 : d4M  // Mean tensor
-    bnRunningVariance1 : d4M  // Variance tensor
-    a1 : d4M -> d4M // Activation function
+    W1 : d4MUnion  // Input weight tensor
+    bnScale1 : d4MUnion  // Scale tensor
+    bnBias1 : d4MUnion  // Bias tensor
+    bnRunningMean1 : d4MUnion  // Mean tensor
+    bnRunningVariance1 : d4MUnion  // Variance tensor
+    a1 : d4MUnion -> d4MUnion // Activation function
 
-    W2 : d4M  // Input weight tensor
-    bnScale2 : d4M  // Scale tensor
-    bnBias2 : d4M  // Bias tensor
-    bnRunningMean2 : d4M  // Mean tensor
-    bnRunningVariance2 : d4M  // Variance tensor
-    a2 : d4M -> d4M // Activation function
+    W2 : d4MUnion  // Input weight tensor
+    bnScale2 : d4MUnion  // Scale tensor
+    bnBias2 : d4MUnion  // Bias tensor
+    bnRunningMean2 : d4MUnion  // Mean tensor
+    bnRunningVariance2 : d4MUnion  // Variance tensor
+    a2 : d4MUnion -> d4MUnion // Activation function
     }      
 
     /// Creates a layer with random weights.
     static member create weight_nchw a1 a2 =
         let bias_sizes = weight_nchw |> fun (n,c,h,w) -> (1,c,1,1)
         
-        let W1 = d4M.makeUniformRandomNode weight_nchw
-        let bnScale1 = bias_sizes |> d4M.create 
+        let W1 = d4MUnion.makeUniformRandomNode weight_nchw
+        let bnScale1 = bias_sizes |> d4MUnion.create 
         bnScale1.setPrimal 0.1f // Initial scale value based on the Recurrent Batch Normalization paper by Cooijmans et al.
         bnScale1.setZeroAdjoint()
-        let bnBias1 = bias_sizes |> d4M.create
+        let bnBias1 = bias_sizes |> d4MUnion.create
         bnBias1.setZeroPrimal()
         bnBias1.setZeroAdjoint()
-        let bnRunningMean1 = bias_sizes |> d4M.createConstant
-        let bnRunningVariance1 = bias_sizes |> d4M.createConstant
+        let bnRunningMean1 = bias_sizes |> d4MUnion.createConstant
+        let bnRunningVariance1 = bias_sizes |> d4MUnion.createConstant
 
-        let W2 = d4M.makeUniformRandomNode weight_nchw
-        let bnScale2 = bias_sizes |> d4M.create 
+        let W2 = d4MUnion.makeUniformRandomNode weight_nchw
+        let bnScale2 = bias_sizes |> d4MUnion.create 
         bnScale2.setPrimal 0.1f // Initial scale value based on the Recurrent Batch Normalization paper by Cooijmans et al.
         bnScale2.setZeroAdjoint()
-        let bnBias2 = bias_sizes |> d4M.create
+        let bnBias2 = bias_sizes |> d4MUnion.create
         bnBias2.setZeroPrimal()
         bnBias2.setZeroAdjoint()
-        let bnRunningMean2 = bias_sizes |> d4M.createConstant
-        let bnRunningVariance2 = bias_sizes |> d4M.createConstant
+        let bnRunningMean2 = bias_sizes |> d4MUnion.createConstant
+        let bnRunningVariance2 = bias_sizes |> d4MUnion.createConstant
 
         { W1 = W1; bnScale1 = bnScale1; bnBias1 = bnBias1; bnRunningMean1 = bnRunningMean1; bnRunningVariance1 = bnRunningVariance1; a1=a1;
           W2 = W2; bnScale2 = bnScale2; bnBias2 = bnBias2; bnRunningMean2 = bnRunningMean2; bnRunningVariance2 = bnRunningVariance2; a2=a2  }
@@ -1794,32 +1927,32 @@ type BNResidualFullyConnectedLayer =
 /// Adapted from the previous version of the library.
 /// An optimized implementation will be done in the future along with union types and streams.
 type LSTMLayer =
-    {W_z:d4M  // Input weight matrix for the block input
-     U_z:d4M  // Recurrent weight matrix for the block input
-     b_z:d4M  // Bias vector for the block input
+    {W_z:d4MUnion  // Input weight matrix for the block input
+     U_z:d4MUnion  // Recurrent weight matrix for the block input
+     b_z:d4MUnion  // Bias vector for the block input
 
-     W_i:d4M  // Input weight matrix for the input gate
-     U_i:d4M  // Recurrent weight matrix for the input gate
-     b_i:d4M  // Bias vector for the input gate
-     P_i:d4M  // Peephole weight matrix for the input gate
+     W_i:d4MUnion  // Input weight matrix for the input gate
+     U_i:d4MUnion  // Recurrent weight matrix for the input gate
+     b_i:d4MUnion  // Bias vector for the input gate
+     P_i:d4MUnion  // Peephole weight matrix for the input gate
 
-     W_f:d4M  // Input weight matrix for the forget gate
-     U_f:d4M  // Recurrent weight matrix for the forget gate
-     b_f:d4M  // Bias vector for the forget gate
-     P_f:d4M  // Peephole weight matrix for the forget gate
+     W_f:d4MUnion  // Input weight matrix for the forget gate
+     U_f:d4MUnion  // Recurrent weight matrix for the forget gate
+     b_f:d4MUnion  // Bias vector for the forget gate
+     P_f:d4MUnion  // Peephole weight matrix for the forget gate
 
-     W_o:d4M  // Input weight matrix for the output gate
-     U_o:d4M  // Recurrent weight matrix for the output gate
-     b_o:d4M  // Bias vector for the output gate
-     P_o:d4M  // Peephole weight matrix for the output gate
+     W_o:d4MUnion  // Input weight matrix for the output gate
+     U_o:d4MUnion  // Recurrent weight matrix for the output gate
+     b_o:d4MUnion  // Bias vector for the output gate
+     P_o:d4MUnion  // Peephole weight matrix for the output gate
 
-     block_input_a : d4M -> d4M
-     block_output_a : d4M -> d4M
+     block_input_a : d4MUnion -> d4MUnion
+     block_output_a : d4MUnion -> d4MUnion
      } 
     
     /// Returns all the weights in an array.
     member l.ToArray = [|l.W_z;l.U_z;l.b_z;l.W_i;l.U_i;l.b_i;l.P_i;l.W_f;l.U_f;l.b_f;l.P_f;l.W_o;l.U_o;l.b_o;l.P_o|]
-    static member fromArray (a: d4M[]) block_input_a block_output_a =
+    static member fromArray (a: d4MUnion[]) block_input_a block_output_a =
         {
          W_z = a.[0]
          U_z = a.[1]
@@ -1846,27 +1979,27 @@ type LSTMLayer =
 
     static member createRandomLSTMLayer input_size hidden_size block_input_a block_output_a =
         {
-        W_z = d4M.makeUniformRandomNode (input_size, hidden_size, 1, 1)
-        U_z = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        b_z = d4M.makeUniformRandomNode (1, hidden_size, 1, 1)
-        W_i = d4M.makeUniformRandomNode (input_size, hidden_size, 1, 1)
-        U_i = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        b_i = d4M.makeUniformRandomNode (1, hidden_size, 1, 1)
-        P_i = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        W_f = d4M.makeUniformRandomNode (input_size, hidden_size, 1, 1)
-        U_f = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        b_f = d4M.makeUniformRandomNode (1, hidden_size, 1, 1)
-        P_f = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        W_o = d4M.makeUniformRandomNode (input_size, hidden_size, 1, 1)
-        U_o = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        b_o = d4M.makeUniformRandomNode (1, hidden_size, 1, 1)
-        P_o = d4M.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        W_z = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
+        U_z = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        b_z = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1)
+        W_i = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
+        U_i = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        b_i = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1)
+        P_i = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        W_f = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
+        U_f = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        b_f = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1)
+        P_f = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        W_o = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
+        U_o = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
+        b_o = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1)
+        P_o = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
 
         block_input_a = block_input_a
         block_output_a = block_output_a
         }
 
-    member l.runLayer (x:d4M) (y:d4M) (c:d4M) =
+    member l.runLayer (x:d4MUnion) (y:d4MUnion) (c:d4MUnion) =
         let block_input = linear_layer_matmult [|l.W_z,x;l.U_z,y|] (Some l.b_z) |> l.block_input_a
         let input_gate = linear_layer_matmult [|l.W_i,x;l.U_i,y;l.P_i,c|] (Some l.b_i) |> sigmoid
         let forget_gate = linear_layer_matmult [|l.W_f,x;l.U_f,y;l.P_f,c|] (Some l.b_f) |> sigmoid
@@ -1874,7 +2007,7 @@ type LSTMLayer =
         let output_gate = linear_layer_matmult [|l.W_o,x;l.U_o,y;l.P_o,c'|] (Some l.b_o) |> sigmoid
         hadmult (l.block_output_a c') output_gate, c'
 
-    member l.runLayerNoH (x:d4M) =
+    member l.runLayerNoH (x:d4MUnion) =
         let block_input = linear_layer_matmult [|l.W_z,x|] (Some l.b_z) |> l.block_input_a
         let input_gate = linear_layer_matmult [|l.W_i,x|] (Some l.b_i) |> sigmoid
         let forget_gate = linear_layer_matmult [|l.W_f,x|] (Some l.b_f) |> sigmoid
@@ -1882,7 +2015,7 @@ type LSTMLayer =
         let output_gate = linear_layer_matmult [|l.W_o,x;l.P_o,c'|] (Some l.b_o) |> sigmoid
         hadmult (l.block_output_a c') output_gate, c'
 
-    member l.runLayerNoI (y:d4M) (c:d4M) =
+    member l.runLayerNoI (y:d4MUnion) (c:d4MUnion) =
         let block_input = linear_layer_matmult [|l.U_z,y|] (Some l.b_z) |> l.block_input_a
         let input_gate = linear_layer_matmult [|l.U_i,y;l.P_i,c|] (Some l.b_i) |> sigmoid
         let forget_gate = linear_layer_matmult [|l.U_f,y;l.P_f,c|] (Some l.b_f) |> sigmoid
@@ -1905,8 +2038,8 @@ let load_data file_name is_constant =
             let num_cols = reader_data.ReadInt32()
             let ar = [|for x=1 to num_rows*num_cols do yield reader_data.ReadSingle()|]
             match is_constant with
-            | true -> yield d4M.createConstant(num_cols,num_rows,1,1,ar)
-            | false -> yield d4M.create(num_cols,num_rows,1,1,ar)
+            | true -> yield d4MUnion.createConstant(((num_cols,num_rows,1,1),ar))
+            | false -> yield d4MUnion.create(((num_cols,num_rows,1,1),ar))
         |]
 
     weights

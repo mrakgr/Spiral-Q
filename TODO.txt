@@ -1,10 +1,2 @@
--Modify the DeviceSum modules so they copy asynchrnously to page locked memory.
-
-"Before I continue, let me do a short list of added features since v1 (some are work in progress):
--4d tensor type
--Convolutional and softmax functions
--Cuda module caching
--Automatic parallelization
--Union 4d tensor type
-
-Asynchronous memory copies should be on that list."
+- Write the optimized concurrent linear layers.
+- Write the optimized LSTM implementation using the unary type and the concurrent linear layers.
