@@ -62,14 +62,22 @@ let training_loop label data = // For now, this is just checking if the new libr
 
 let learning_rate = 0.03f
 
-let t = 
-    l1.runLayer (defaultConvPar, train_images.[0])
-    |> fun x -> l2.runLayer (defaultConvPar, x)
-    |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
-    |> fun x -> l4.runLayer (defaultConvPar, x)
-    |> fun x -> l5.runLayer (defaultConvPar, x)
-//    |> fun x -> cross_entropy_cost train_labels.[0] x
+let t =
+    [|
+    for i=1 to 10 do
+        let r = 
+            l1.runLayer (defaultConvPar, train_images.[0])
+            |> fun x -> l2.runLayer (defaultConvPar, x)
+            |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
+            |> fun x -> l4.runLayer (defaultConvPar, x)
+            |> fun x -> l5.runLayer (defaultConvPar, x)
+            |> fun x -> cross_entropy_cost train_labels.[0] x
+        let er = r.P.Value
+        yield er
+        ObjectPool.Reset() // Resets all the adjoints from the top of the pointer in the object pool along with the pointers.
+        base_nodes |> Array.iter (fun x -> x.setZeroAdjoint())
 
-let t'' = t.P.Gather()
-
-t'' = t'
+        r.A := 1.0f // Loads the 1.0f at the top
+        while tape.Count > 0 do tape.Pop() |> fun x -> x() // The backpropagation step
+        base_nodes |> Array.iter (fun x -> saxpy -learning_rate x.A' x.P') // Stochastic gradient descent.
+        |]

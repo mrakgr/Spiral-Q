@@ -20,6 +20,9 @@ open System.IO
 #load "spiral_q_v0.fsx"
 #endif
 open SpiralV3
+open ManagedCuda
+
+printfn "Free Memory=%i" (int <| ctx.GetFreeDeviceMemorySize())
 
 let minibatch_size = 128
 let load_mnist filename =
@@ -52,6 +55,7 @@ let [|test_images;test_labels;train_images;train_labels|] =
     [|"t10k-images.idx3-ubyte";"t10k-labels.idx1-ubyte";"train-images.idx3-ubyte";"train-labels.idx1-ubyte"|]
     |> Array.map (fun x -> Path.Combine(__SOURCE_DIRECTORY__,x) |> load_mnist)
 
+CudaContext.ProfilerStart()
 
 let l1 = ConvolutionalFeedforwardLayer.createRandomLayer (128,1,5,5) relu
 let l2 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
@@ -75,14 +79,23 @@ let training_loop label data = // For now, this is just checking if the new libr
 
 let learning_rate = 0.03f
 
-let t = 
-    ctx.Synchronize()
-    l1.runLayer (defaultConvPar, train_images.[0])
-    |> fun x -> l2.runLayer (defaultConvPar, x)
-    |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
-    |> fun x -> l4.runLayer (defaultConvPar, x)
-    |> fun x -> l5.runLayer (defaultConvPar, x)
-//    |> fun x -> cross_entropy_cost train_labels.[0] x
+let t =
+    [|
+    for i=1 to 10 do
+        let r = 
+            l1.runLayer (defaultConvPar, train_images.[0])
+            |> fun x -> l2.runLayer (defaultConvPar, x)
+            |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
+            |> fun x -> l4.runLayer (defaultConvPar, x)
+            |> fun x -> l5.runLayer (defaultConvPar, x)
+            |> fun x -> cross_entropy_cost train_labels.[0] x
+        let er = r.P.Value.Value
+        yield er
+        
+        backprop_tape base_nodes r (sgd learning_rate)
+        |]
 
+CudaContext.ProfilerStop()
 
-let t' = t.P.Gather()
+printfn "%A" t
+

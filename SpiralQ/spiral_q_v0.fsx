@@ -40,7 +40,7 @@ type StreamPool(num) =
         s.WaitEvent e.Event
         t
 
-let StreamPool = new StreamPool(16) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
+let StreamPool = new StreamPool(1) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
 
 // Set the Cuda libraries handles to the above stream.
 let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
@@ -156,9 +156,9 @@ type d4MUnion =
     mutable adjoint_occupied : ResizeArray<CudaEvent>
     }  
 
-    static member private ar_scan (ar : (int * int * int * int)[]) = ar |> Array.scan (fun state e -> state + sizeof<float32> * size_nchw e) 0
-    static member private ar_fold (ar : (int * int * int * int)[]) = ar |> Array.fold (fun state e -> state + sizeof<float32> * size_nchw e) 0
-    static member private make_elements (p : CudaDeviceVariable<float32>) (a : CudaDeviceVariable<float32> option) (ar : (int * int * int * int)[]) (l : int[]) =
+    static member ar_scan (ar : (int * int * int * int)[]) = ar |> Array.scan (fun state e -> state + sizeof<float32> * size_nchw e) 0
+    static member ar_fold (ar : (int * int * int * int)[]) = ar |> Array.fold (fun state e -> state + sizeof<float32> * size_nchw e) 0
+    static member make_elements (p : CudaDeviceVariable<float32>) (a : CudaDeviceVariable<float32> option) (ar : (int * int * int * int)[]) (l : int[]) =
         [|
         for i=0 to l.Length-2 do
             let x = ar.[i]
@@ -171,14 +171,14 @@ type d4MUnion =
                 | None -> None
         |]
 
-    static member private create' (ar : (int * int * int * int)[], is_constant) =
+    static member create' (ar : (int * int * int * int)[], is_constant) =
         let l = d4MUnion.ar_scan ar
         let p,a = l |> Array.last |> fun x -> x / sizeof<float32> |> SizeT |> fun x -> new CudaDeviceVariable<float32>(x), if is_constant = false then new CudaDeviceVariable<float32>(x) |> Some else None
         let elements = d4MUnion.make_elements p a ar l
         
         {elements = elements; P=p; A=a; is_dead=Undefined; primal_occupied = ResizeArray(); adjoint_occupied = ResizeArray()}
 
-    static member private create' (ar_data : ((int * int * int * int) * float32[]) [], is_constant) =
+    static member create' (ar_data : ((int * int * int * int) * float32[]) [], is_constant) =
         let ar, data = Array.unzip ar_data
         let t = d4MUnion.create' (ar, is_constant)
         for i=0 to data.Length-1 do
@@ -458,20 +458,18 @@ type ObjectPool() =
 
     /// Sets only the object pool pointers to zero.
     /// Unlike in V2 of Spiral, in this version the adjoints are set to zero during the forward phase.
-    member inline t.ResetPointers() =
+    member t.ResetPointers() =
         d4Mp := 0
         wp := 0
 
     /// Resets the occupancy arrays of all the objects in the pool and sets the pointers to zero.
     /// Blocks the device and also, triggers .NET GC because why not?
-    member inline t.ResetOccupancy() =
+    member t.ResetOccupancy() =
         for i=0 to d4MPool.Count-1 do
             d4MPool.[i].primal_occupied.Clear()
             d4MPool.[i].adjoint_occupied.Clear()
         t.ResetPointers()
         ctx.Synchronize()
-
-
 
 let ObjectPool = new ObjectPool() // In the past iteration of the library, the object pool's role was taken by the tape. Not anymore.
 
@@ -483,6 +481,7 @@ let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> uni
     ObjectPool.ResetOccupancy() // This step is a good one to make here.
     while tape.Count > 0 do
         tape.Pop()()
+        //ctx.Synchronize()
     base_nodes |> Array.iter update
     ObjectPool.ResetOccupancy()
 
@@ -543,7 +542,7 @@ type DeviceUnaryTransformModule(op: string, unique_name : string) =
 
     let kernel = load_kernel kernel_code kernel_name
 
-    member inline t.A((x_nchw, x: CUdeviceptr, x_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
+    member t.A((x_nchw, x: CUdeviceptr, x_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
         if x_nchw <> o_nchw then failwith "x_nchw <> o_nchw in DeviceUnaryTransformModule"
         let n = size_nchw x_nchw
 
@@ -586,7 +585,7 @@ type DeviceBinaryTransformModule(op: string, unique_name) =
     
     let kernel = load_kernel kernel_code kernel_name
 
-    member inline t.A((x_nchw, x: CUdeviceptr, x_occ),(y_nchw, y: CUdeviceptr, y_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
+    member t.A((x_nchw, x: CUdeviceptr, x_occ),(y_nchw, y: CUdeviceptr, y_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
         if x_nchw <> y_nchw then failwith "x_nchw <> y_nchw in DeviceBinaryTransformModule"
         if y_nchw <> o_nchw then failwith "y_nchw <> o_nchw in DeviceBinaryTransformModule"
         let n = size_nchw x_nchw
@@ -696,7 +695,7 @@ type DeviceUnaryMapSumModule(op: string, unique_name) =
 
     let o = new_dev<float32> 1
 
-    member inline t.A((x_nchw, x: CUdeviceptr, x_occ)) =
+    member t.A((x_nchw, x: CUdeviceptr, x_occ)) =
         let n = size_nchw x_nchw
         
         let gridSize = min (2*numSm*(1024/block_size)) (divup n block_size)
@@ -761,7 +760,7 @@ type DeviceBinaryMapSumModule(op: string, unique_name) =
 
     let o = new_dev<float32> 1
 
-    member inline t.A((x_nchw, x: CUdeviceptr, x_occ),(y_nchw, y: CUdeviceptr, y_occ)) =
+    member t.A((x_nchw, x: CUdeviceptr, x_occ),(y_nchw, y: CUdeviceptr, y_occ)) =
         if x_nchw <> y_nchw then failwith "x_nchw <> y_nchw in DeviceBinaryMapSumModule"
         let n = size_nchw x_nchw
 
@@ -822,7 +821,7 @@ type DeviceUnaryCoefTransformModule(op: string, unique_name) =
             IO.File.WriteAllBytes(kernel_path,ptx)
             ctx.LoadKernelPTX(ptx,kernel_name)
 
-    member inline t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
+    member t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
         if x_nchw <> o_nchw then failwith "x.nchw <> o.nchw in DeviceUnaryCoefTransformModule"
         let n = size_nchw x_nchw
 
@@ -881,7 +880,7 @@ type DeviceBinaryCoefTransformModule(op: string, unique_name) =
             IO.File.WriteAllBytes(kernel_path,ptx)
             ctx.LoadKernelPTX(ptx,kernel_name)
 
-    member inline t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), coef_y: float32, (y_nchw, y: CUdeviceptr, y_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
+    member t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), coef_y: float32, (y_nchw, y: CUdeviceptr, y_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
         if x_nchw <> y_nchw then failwith "x_nchw <> y_nchw in DeviceBinaryCoefTransformModule"
         if y_nchw <> o_nchw then failwith "y_nchw <> o_nchw in DeviceBinaryCoefTransformModule"
         let n = size_nchw x_nchw
@@ -940,7 +939,7 @@ type DeviceTrinaryCoefTransformModule(op: string, unique_name) =
             IO.File.WriteAllBytes(kernel_path,ptx)
             ctx.LoadKernelPTX(ptx,kernel_name)
 
-    member inline t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), coef_y: float32, (y_nchw, y: CUdeviceptr, y_occ), coef_z: float32, (z_nchw, z: CUdeviceptr, z_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
+    member t.A(coef_x: float32, (x_nchw, x: CUdeviceptr, x_occ), coef_y: float32, (y_nchw, y: CUdeviceptr, y_occ), coef_z: float32, (z_nchw, z: CUdeviceptr, z_occ), (o_nchw, o: CUdeviceptr, o_occ)) =
         if x_nchw <> y_nchw then failwith "x_nchw <> y_nchw in DeviceTrinaryCoefTransformModule"
         if y_nchw <> z_nchw then failwith "y_nchw <> z_nchw in DeviceTrinaryCoefTransformModule"
         if z_nchw <> o_nchw then failwith "z_nchw <> o_nchw in DeviceTrinaryCoefTransformModule"
@@ -1231,7 +1230,7 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
         else 
             left
 
-    if true || left_nchw <> right_nchw then
+    if left_nchw <> right_nchw then
         cudnn_unary_stream_function right.primal_occupied output.primal_occupied 
         <| fun _ -> cudnn.AddTensor(beta,rightDesc,right.P,alpha,leftDesc,output.P) // Add right to output.
     else geam nT nT beta right.P' alpha output.P' output.P'
@@ -1360,7 +1359,7 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
                 |> ObjectPool.getWorkspace
             deadness_check output data 
             <| fun _ ->
-                cudnn_unary_stream_function output.adjoint_occupied filter.adjoint_occupied
+                cudnn_unary_stream_function output.adjoint_occupied data.adjoint_occupied
                 <| fun _ -> cudnn.ConvolutionBackwardData(1.0f,filterDesc,filter.P,dstTensorDesc,output.A.Value,convDesc,1.0f,algo,workspace,srcTensorDesc,data.A.Value)
         tape.Push(convolution_backwards_data)
 

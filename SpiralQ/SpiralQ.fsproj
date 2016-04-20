@@ -6,7 +6,7 @@
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>ed75f608-06a2-40de-b4d3-96118a73adec</ProjectGuid>
-    <OutputType>Library</OutputType>
+    <OutputType>Exe</OutputType>
     <RootNamespace>SpiralQ</RootNamespace>
     <AssemblyName>SpiralQ</AssemblyName>
     <TargetFrameworkVersion>v4.6</TargetFrameworkVersion>
@@ -53,14 +53,33 @@
     <Compile Include="AssemblyInfo.fs" />
     <None Include="spiral_q_v0.fsx" />
     <None Include="mnist_example_v2.fsx" />
-    <None Include="test_v0.fsx" />
+    <Compile Include="test_v0.fs" />
     <None Include="test_v0%27.fsx" />
     <None Include="test_v1.fsx" />
+    <None Include="callback_example.fsx" />
   </ItemGroup>
   <ItemGroup>
+    <Reference Include="CudaBlas">
+      <HintPath>..\..\managedCuda\CudaBlas\bin\x64\Release\CudaBlas.dll</HintPath>
+    </Reference>
+    <Reference Include="CudaDNNv5">
+      <HintPath>..\..\managedCuda\CudaDNNv5\bin\Release\CudaDNNv5.dll</HintPath>
+    </Reference>
+    <Reference Include="CudaRand">
+      <HintPath>..\..\managedCuda\CudaRand\bin\x64\Release\CudaRand.dll</HintPath>
+    </Reference>
+    <Reference Include="ManagedCuda">
+      <HintPath>..\..\managedCuda\ManagedCUDA\bin\Release\ManagedCuda.dll</HintPath>
+    </Reference>
     <Reference Include="mscorlib" />
     <Reference Include="FSharp.Core, Version=$(TargetFSharpCoreVersion), Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a">
       <Private>True</Private>
+    </Reference>
+    <Reference Include="NPP">
+      <HintPath>..\..\managedCuda\NPP\bin\x64\Release\NPP.dll</HintPath>
+    </Reference>
+    <Reference Include="NVRTC">
+      <HintPath>..\..\managedCuda\NVRTC\bin\x64\Release\NVRTC.dll</HintPath>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
