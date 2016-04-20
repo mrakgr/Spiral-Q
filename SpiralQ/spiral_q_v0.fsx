@@ -40,7 +40,7 @@ type StreamPool(num) =
         s.WaitEvent e.Event
         t
 
-let StreamPool = new StreamPool(128) // 1024 of them take roughly 50Mb, so I've settled on the 128 number.
+let StreamPool = new StreamPool(1024) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
 
 // Set the Cuda libraries handles to the above stream.
 let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
@@ -60,6 +60,7 @@ let inline to_dev (host_ar: 't []) =
 let inline to_host (dev_ar: CudaDeviceVariable<'t>) =
     let h_a = Array.zeroCreate<'t> (int dev_ar.Size)
     dev_ar.CopyToHost(h_a)
+    ctx.Synchronize()
     h_a
 
 /// Copies the device array to host. Extends the CudaDeviceVariable class.
@@ -455,28 +456,35 @@ type ObjectPool() =
             (fun _ -> new TensorDescriptor()) 
             (fun (t: TensorDescriptor) (nchw, mode, srcDesc) -> cudnn.DeriveBNTensorDescriptor(t,srcDesc,mode))
 
-    /// Resets the occupancy arrays of all the objects in the pool.
-    /// Blocks the device and also, triggers .NET GC because why not?
-    member inline t.ResetOccupancy() =
-        for i=0 to d4MPool.Count-1 do
-            d4MPool.[i].primal_occupied.Clear()
-            d4MPool.[i].adjoint_occupied.Clear()
-        GC.Collect() // This one might be unneeded.
-        ctx.Synchronize()
     /// Sets only the object pool pointers to zero.
     /// Unlike in V2 of Spiral, in this version the adjoints are set to zero during the forward phase.
     member inline t.ResetPointers() =
         d4Mp := 0
         wp := 0
 
+    /// Resets the occupancy arrays of all the objects in the pool and sets the pointers to zero.
+    /// Blocks the device and also, triggers .NET GC because why not?
+    member inline t.ResetOccupancy() =
+        for i=0 to d4MPool.Count-1 do
+            d4MPool.[i].primal_occupied.Clear()
+            d4MPool.[i].adjoint_occupied.Clear()
+        t.ResetPointers()
+        ctx.Synchronize()
+
+
 
 let ObjectPool = new ObjectPool() // In the past iteration of the library, the object pool's role was taken by the tape. Not anymore.
 
 let tape = new Stack<(unit -> unit)>(1000) // Nice and simple way of passing in the closures for the backprop step.
-let backprop_tape() =
+
+let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> unit) =
+    base_nodes |> Array.iter (fun x -> x.setZeroAdjoint())
+    top.A := 1.0f
     ObjectPool.ResetOccupancy() // This step is a good one to make here.
     while tape.Count > 0 do
         tape.Pop()()
+    base_nodes |> Array.iter update
+    ObjectPool.ResetOccupancy()
 
 let inline divup a b = (a-1)/b+1 // Integer division with rounding up. (a+b-1)/b is another variant on this.
 
@@ -1304,6 +1312,8 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
     let data_sizes = data.nchw
     let filter_sizes = filter.nchw
 
+    ctx.Synchronize()
+
     let srcTensorDesc = ObjectPool.getTensorDescriptor data_sizes
     
     let filterDesc = ObjectPool.getFilterDescriptor filter_sizes
@@ -1325,12 +1335,16 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
         cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) |> int
         |> ObjectPool.getWorkspace
 
+    ctx.Synchronize()
+
     let beta = 
         match prev_output with
         | None -> 0.0f
         | Some _ -> 1.0f
     cudnn_binary_stream_function data.primal_occupied filter.primal_occupied output.primal_occupied
     <| fun _ -> cudnn.ConvolutionForward(1.0f,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,beta,dstTensorDesc,output.P) // Don't zero out the previous output.
+
+    ctx.Synchronize()
 
     if filter.A.IsSome then 
         let convolution_backwards_filter () =
@@ -1521,7 +1535,9 @@ let scalar_matrix_add scalar coef (a:d4MUnion) =
     scalarMatrixAddModule.Value.A(scalar,a.P',coef,a.P',c.P')
 
     if a.A.IsSome then
-        let scalar_matrix_add_backward () = saxpy coef c.A' a.A'
+        let scalar_matrix_add_backward () = 
+            deadness_check c a
+            <| fun _ -> saxpy coef c.A' a.A'
         tape.Push scalar_matrix_add_backward
     c
 
@@ -1570,7 +1586,8 @@ let clip min max (a : d4MUnion) scalar =
 
     if a.A.IsSome then
         let clip_backward () = 
-            clipErrorModule.Value.A(min,a.P',max,c.A',max,a.A',a.A')
+            deadness_check c a
+            <| fun _ -> clipErrorModule.Value.A(min,a.P',max,c.A',max,a.A',a.A')
         tape.Push clip_backward
     c
 
@@ -1615,7 +1632,7 @@ let find_max_index (action_values : float32[]) =
 
 type d4MUnion with
     static member makeUniformRandomNode (n,c,h,w as nchw) =
-        let scale = (2.0f / sqrt(add_nchw nchw |> float32))
+        let scale = (1.0f / sqrt(add_nchw nchw |> float32))
         let p = d4MUnion.create((n,c,h,w))
         fillRandomUniformMatrix p.P' scale 0.0f
         p
@@ -1643,8 +1660,8 @@ type ConvolutionalFeedforwardLayer =
         } 
 
     member l.runLayer (convPars,x:d4MUnion) =
-        linear_layer_conv [|convPars,x,l.W|] (Some l.b)
-        |> l.a
+        linear_layer_conv [|convPars,x,l.W|] None//(Some l.b)
+        //|> l.a
 
     member l.ToArray = [|l.W;l.b|]
     member t.ResetAdjoints () = t.W.setZeroAdjoint(); t.b.setZeroAdjoint()
@@ -2043,3 +2060,5 @@ let load_data file_name is_constant =
         |]
 
     weights
+
+let sgd learning_rate (node : d4MUnion) = saxpy -learning_rate node.A' node.P'

@@ -52,6 +52,9 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <None Include="spiral_q_v0.fsx" />
+    <None Include="mnist_example_v2.fsx" />
+    <None Include="test_v0.fsx" />
+    <None Include="test_v0%27.fsx" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="mscorlib" />
