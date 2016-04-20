@@ -55,6 +55,7 @@
     <None Include="mnist_example_v2.fsx" />
     <None Include="test_v0.fsx" />
     <None Include="test_v0%27.fsx" />
+    <None Include="test_v1.fsx" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="mscorlib" />

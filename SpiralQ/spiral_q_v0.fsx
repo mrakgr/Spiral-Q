@@ -40,7 +40,7 @@ type StreamPool(num) =
         s.WaitEvent e.Event
         t
 
-let StreamPool = new StreamPool(1024) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
+let StreamPool = new StreamPool(16) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
 
 // Set the Cuda libraries handles to the above stream.
 let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
@@ -1043,16 +1043,16 @@ let randMapModule = lazy DeviceBinaryCoefTransformModule("coef_x*(x-0.5f)+coef_y
 /// Fills matrix by sampling from a random uniform distribution in <-1.0f,1.0f]
 let fillRandomUniformMatrix (x_nchw, x : CUdeviceptr, x_occ as x') (scaling_factor : float32) location =
     
-    let s,e = StreamPool.P
-    cudaRandom.SetStream s.Stream
-
-    wait_on_event s x_occ
-
+//    let s,e = StreamPool.P
+//    cudaRandom.SetStream s.Stream
+//
+//    wait_on_event s x_occ
+//
     use x'' = ptr_to_device_variable x_nchw x
-    cudaRandom.GenerateUniform(x'')
+    cudaRandom.GenerateUniform(x'') // Uses the null stream because using others make the results non deterministic.
 
-    e.Record s.Stream
-    x_occ.Add e
+//    e.Record s.Stream
+//    x_occ.Add e
 
     // 2.0f*scaling_factor ensures that it is rescaled around zero if the scaling_factor is 1.0f.
     randMapModule.Value.A(2.0f*scaling_factor,x',location,x',x')
@@ -1215,7 +1215,7 @@ let inline private cudnn_binary_stream_function left_occ right_occ output_occ (f
 /// Can be used to add matrices or for (4D)matrix-vector broadcast addition.
 /// The output dimensions are based on the left argument.
 /// Those dimenions the size of 1 of the right argument are broadcasted.
-let inline private tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnion) =
+let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnion) =
     let left_nchw = left.nchw
     let right_nchw = right.nchw
     let leftDesc = ObjectPool.getTensorDescriptor left_nchw
@@ -1226,15 +1226,15 @@ let inline private tensor_add' add_to_left alpha (left : d4MUnion) beta (right :
         then 
             ObjectPool.getd4M (false, left_nchw) 
             |> fun output -> 
-                geam nT nT alpha left.P' 0.0f output.P' output.P'
+                geam nT nT 1.0f left.P' 0.0f output.P' output.P'
                 output
         else 
             left
 
-    if left_nchw <> right_nchw then
+    if true || left_nchw <> right_nchw then
         cudnn_unary_stream_function right.primal_occupied output.primal_occupied 
-        <| fun _ -> cudnn.AddTensor(beta,rightDesc,right.P,1.0f,leftDesc,output.P) // Add right to output.
-    else geam nT nT beta right.P' 1.0f output.P' output.P'
+        <| fun _ -> cudnn.AddTensor(beta,rightDesc,right.P,alpha,leftDesc,output.P) // Add right to output.
+    else geam nT nT beta right.P' alpha output.P' output.P'
 
     if right.A.IsSome then 
         let tensor_add_right_backwards () =
@@ -1312,8 +1312,6 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
     let data_sizes = data.nchw
     let filter_sizes = filter.nchw
 
-    ctx.Synchronize()
-
     let srcTensorDesc = ObjectPool.getTensorDescriptor data_sizes
     
     let filterDesc = ObjectPool.getFilterDescriptor filter_sizes
@@ -1335,16 +1333,12 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
         cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) |> int
         |> ObjectPool.getWorkspace
 
-    ctx.Synchronize()
-
     let beta = 
         match prev_output with
         | None -> 0.0f
         | Some _ -> 1.0f
     cudnn_binary_stream_function data.primal_occupied filter.primal_occupied output.primal_occupied
     <| fun _ -> cudnn.ConvolutionForward(1.0f,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,beta,dstTensorDesc,output.P) // Don't zero out the previous output.
-
-    ctx.Synchronize()
 
     if filter.A.IsSome then 
         let convolution_backwards_filter () =
@@ -1660,8 +1654,8 @@ type ConvolutionalFeedforwardLayer =
         } 
 
     member l.runLayer (convPars,x:d4MUnion) =
-        linear_layer_conv [|convPars,x,l.W|] None//(Some l.b)
-        //|> l.a
+        linear_layer_conv [|convPars,x,l.W|] (Some l.b)
+        |> l.a
 
     member l.ToArray = [|l.W;l.b|]
     member t.ResetAdjoints () = t.W.setZeroAdjoint(); t.b.setZeroAdjoint()

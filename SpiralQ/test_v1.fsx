@@ -6,13 +6,6 @@
 
 // Let me see if I can at least get a sequence of geams to execute correctly.
 
-// Edit2: I really spent 3 hours just now chasing down non bugs. First the inits were wrong in _v3
-// and then it turns out that cudaRandom changes its behavior on different streams.
-
-// I think the library is basically working correctly, but I still need to do some more test.
-// I want to see whether cudaRandom outputs the same thing when it switches streams and whether
-// the things actually run correctly on the Mnist example now.
-
 open System
 open System.IO
 
@@ -53,36 +46,17 @@ let [|test_images;test_labels;train_images;train_labels|] =
     |> Array.map (fun x -> Path.Combine(__SOURCE_DIRECTORY__,x) |> load_mnist)
 
 
-let l1 = ConvolutionalFeedforwardLayer.createRandomLayer (128,1,5,5) relu
-let l2 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l3 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l4 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l5 = ConvolutionalFeedforwardLayer.createRandomLayer (10,128,4,4) clipped_sigmoid
+let l1 = d4MUnion.createConstant((1024,1024,1,1))
+let l2 = d4MUnion.createConstant((1024,1024,1,1))
+let l3 = d4MUnion.createConstant((1024,1024,1,1))
+let l4 = d4MUnion.createConstant((1024,1024,1,1))
+let l5 = d4MUnion.createConstant((1024,1024,1,1))
 
-let base_nodes = [|l1;l2;l3;l4;l5|] |> Array.collect (fun x -> x.ToArray)
-//base_nodes |> Array.iter (fun x -> x.setPrimal 1.0f)
+l1.setPrimal 1.0f
 
-let training_loop label data = // For now, this is just checking if the new library can overfit on a single minibatch.
-    [|
-    defaultConvPar,l1
-    defaultConvPar,l2
-    {defaultConvPar with stride_h=2; stride_w=2},l3
-    defaultConvPar,l4
-    defaultConvPar,l5
-    |] 
-    |> Array.fold (fun x (convPars,layer) -> layer.runLayer (convPars,x)) data
-    |> fun x -> get_accuracy label x, cross_entropy_cost label x
+tensor_add' true 0.0f l2 1.0f l1
+tensor_add' true 0.0f l3 1.0f l2
+tensor_add' true 0.0f l4 1.0f l3
+tensor_add' true 0.0f l5 1.0f l4
 
-let learning_rate = 0.03f
-
-let t = 
-    ctx.Synchronize()
-    l1.runLayer (defaultConvPar, train_images.[0])
-    |> fun x -> l2.runLayer (defaultConvPar, x)
-    |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
-    |> fun x -> l4.runLayer (defaultConvPar, x)
-    |> fun x -> l5.runLayer (defaultConvPar, x)
-//    |> fun x -> cross_entropy_cost train_labels.[0] x
-
-
-let t' = t.P.Gather()
+l5.P.Gather() |> Array.sum

@@ -47,6 +47,7 @@ let l4 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
 let l5 = ConvolutionalFeedforwardLayer.createRandomLayer (10,128,4,4) clipped_sigmoid
 
 let base_nodes = [|l1;l2;l3;l4;l5|] |> Array.collect (fun x -> x.ToArray)
+//base_nodes |> Array.iter (fun x -> x.setPrimal 1.0f)
 
 let training_loop label data = // For now, this is just checking if the new library can overfit on a single minibatch.
     [|
@@ -64,9 +65,9 @@ let learning_rate = 0.03f
 let t = 
     l1.runLayer (defaultConvPar, train_images.[0])
     |> fun x -> l2.runLayer (defaultConvPar, x)
-//    |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
-//    |> fun x -> l4.runLayer (defaultConvPar, x)
-//    |> fun x -> l5.runLayer (defaultConvPar, x)
+    |> fun x -> l3.runLayer ({defaultConvPar with stride_h=2; stride_w=2}, x)
+    |> fun x -> l4.runLayer (defaultConvPar, x)
+    |> fun x -> l5.runLayer (defaultConvPar, x)
 //    |> fun x -> cross_entropy_cost train_labels.[0] x
 
 let t'' = t.P.Gather()
