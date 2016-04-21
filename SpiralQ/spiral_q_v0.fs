@@ -23,6 +23,7 @@ open ManagedCuda.CudaDNNv5
 
 open System
 open System.Collections.Generic
+open System.Runtime.InteropServices
 
 // Initialize the context. Analogous to a CPU process. Cuda tries to offload as much as possible during context creation so there aren't
 // any unexpected delays later.
@@ -40,7 +41,7 @@ type StreamPool(num) =
         s.WaitEvent e.Event
         t
 
-let StreamPool = new StreamPool(1) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
+let StreamPool = new StreamPool(1024) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
 
 // Set the Cuda libraries handles to the above stream.
 let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
@@ -48,6 +49,18 @@ let cudnn = new CudaDNNContext()
 let cudaRandom = new CudaRand.CudaRandDevice(GeneratorType.PseudoDefault)
 
 // I'll skip aliasing float32 to floatType for this iteration of the library. There is not point to it as Cuda native functions cannot be overloaded this way.
+
+type unit_to_unit_delegate = delegate of unit -> unit
+let add_callback_to_stream (str : CudaStream) (callback : unit -> unit) =
+    let callb (str : CUstream) (res : CUResult) (p : nativeint) =
+        let t : unit_to_unit_delegate = Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(p)
+        t.Invoke()
+
+    let aux = new unit_to_unit_delegate (callback)
+    let ptr_to_aux = Marshal.GetFunctionPointerForDelegate aux
+
+    let cuda_callback = CUstreamCallback(callb)
+    str.AddCallback(cuda_callback,ptr_to_aux,CUStreamAddCallbackFlags.None)
 
 // Helper functions
 /// Copies a host array to device.
@@ -91,8 +104,7 @@ type Df =
 
 /// Wait for all the event in the occupancy array to finish.
 let wait_on_event (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        occupied_ar
-        |> Seq.iter (fun x -> s.WaitEvent x.Event)
+        occupied_ar |> Seq.iter (fun x -> s.WaitEvent x.Event)
 
 /// Projects nchw dimensions to a row, column dimension according to the following formula:
 /// row = c*h*w
@@ -481,7 +493,7 @@ let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> uni
     ObjectPool.ResetOccupancy() // This step is a good one to make here.
     while tape.Count > 0 do
         tape.Pop()()
-        //ctx.Synchronize()
+    ctx.Synchronize()
     base_nodes |> Array.iter update
     ObjectPool.ResetOccupancy()
 
@@ -1376,7 +1388,6 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
     let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
 
     let bnDesc = 
-        //bnBias.nchw |> ObjectPool.getTensorDescriptor
         ObjectPool.getBNDescriptor (input_sizes, bnMode, srcTensorDesc)
 
     let _ =
@@ -1402,13 +1413,13 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
                 let dx_alpha, dx_beta = 1.0f, 1.0f
                 let param_alpha, param_beta = 1.0f, 1.0f
 
-                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
-                <| fun _ -> cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
+                deadness_check output input 
+                <| fun _ ->
+                    cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                    <| fun _ -> cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
                 
             tape.Push batch_normalization_backward
     else
-        deadness_check output input 
-        <| fun _ ->
             cudnn_unary_stream_function input.primal_occupied output.primal_occupied
             <| fun _ -> cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
         

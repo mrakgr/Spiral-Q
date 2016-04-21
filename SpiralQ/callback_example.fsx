@@ -23,14 +23,14 @@ open System.Runtime.InteropServices
 
 let str = new CudaStream()
 
-type d1 = delegate of unit -> unit
+type unit_to_unit_delegate = delegate of unit -> unit
 let add_callback_to_stream (str : CudaStream) (callback : unit -> unit) =
     let callb (str : CUstream) (res : CUResult) (p : nativeint) =
         let f = p.ToPointer()
-        let t : d1 = Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(p)
+        let t : unit_to_unit_delegate = Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(p)
         t.Invoke()
 
-    let aux : d1 = new d1 (callback)
+    let aux = new unit_to_unit_delegate (callback)
     let ptr_to_aux = Marshal.GetFunctionPointerForDelegate aux
 
     let res = CUResult.Success

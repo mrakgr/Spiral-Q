@@ -51,12 +51,12 @@
   <Import Project="$(FSharpTargetsPath)" />
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
-    <None Include="spiral_q_v0.fsx" />
     <None Include="mnist_example_v2.fsx" />
-    <Compile Include="test_v0.fs" />
     <None Include="test_v0%27.fsx" />
     <None Include="test_v1.fsx" />
     <None Include="callback_example.fsx" />
+    <Compile Include="spiral_q_v0.fs" />
+    <Compile Include="test_v0.fs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">
