@@ -40,15 +40,18 @@ let [|test_images;test_labels;train_images;train_labels|] =
     |> Array.map (fun x -> Path.Combine(__SOURCE_DIRECTORY__,x) |> load_mnist)
 
 
-let l1 = ConvolutionalFeedforwardLayer.createRandomLayer (128,1,5,5) relu
-let l2 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l3 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l4 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l5 = ConvolutionalFeedforwardLayer.createRandomLayer (10,128,4,4) clipped_sigmoid
+let l1 = BNConvolutionalLayer.create (128,1,5,5) relu
+let l2 = BNConvolutionalLayer.create (128,128,5,5) relu
+let l3 = BNConvolutionalLayer.create (128,128,5,5) relu
+let l4 = BNConvolutionalLayer.create (128,128,5,5) relu
+let l5 = BNConvolutionalLayer.create (10,128,4,4) clipped_sigmoid
 
-let base_nodes = [|l1;l2;l3;l4;l5|] |> Array.collect (fun x -> x.ToArray)
+let base_nodes = [|l1;l2;l3;l4;l5|] |> Array.collect (fun x -> x.ToArray |> Array.filter (fun x -> x.A.IsSome))
 
-let training_loop label data = // For now, this is just checking if the new library can overfit on a single minibatch.
+let training_loop label data i =
+    let i' = !i
+    i := i'+1
+    let factor = 1.0/(1.0 + float i')
     [|
     defaultConvPar,l1
     defaultConvPar,l2
@@ -56,16 +59,28 @@ let training_loop label data = // For now, this is just checking if the new libr
     defaultConvPar,l4
     defaultConvPar,l5
     |] 
-    |> Array.fold (fun x (convPars,layer) -> layer.runLayer (convPars,x)) data
+    |> Array.fold (fun x (convPars,layer) -> layer.train (convPars,x) factor) data
     |> fun x -> get_accuracy label x, cross_entropy_cost label x
 
-let learning_rate = 0.03f
+let inference_loop label data = // For now, this is just checking if the new library can overfit on a single minibatch.
+    [|
+    defaultConvPar,l1
+    defaultConvPar,l2
+    {defaultConvPar with stride_h=2; stride_w=2},l3
+    defaultConvPar,l4
+    defaultConvPar,l5
+    |] 
+    |> Array.fold (fun x (convPars,layer) -> layer.inference (convPars,x) ) data
+    |> fun x -> get_accuracy label x, cross_entropy_cost label x
+
+let learning_rate = 1.5f
 
 let test() =
+    let c = ref 0
     for i=1 to 1 do
         let mutable er = 0.0f
         for j=0 to train_images.Length-1 do
-            let _,r = training_loop train_labels.[j] train_images.[j] // Forward step
+            let _,r = training_loop train_labels.[j] train_images.[j] c // Forward step
             er <- er + r.P.Value.Value
             printfn "CE cost on the minibatch is %f at batch %i" r.P.Value.Value j
 
@@ -78,7 +93,7 @@ let test() =
 
         let mutable acc = 0.0f
         for j=0 to test_images.Length-1 do
-            let acc',r = training_loop test_labels.[j] test_images.[j] // Forward step
+            let acc',r = inference_loop test_labels.[j] test_images.[j] // Forward step
             acc <- acc'.Value + acc
             tape.Clear()
             ObjectPool.ResetOccupancy()
@@ -89,3 +104,4 @@ let test() =
 #time
 test()
 #time
+

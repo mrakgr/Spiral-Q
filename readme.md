@@ -30,3 +30,9 @@ UPDATE 4/23/2016: Done with the second rewrite. Thanks to the experience of the 
 At least, that is how I imagine it right now. Hopefully what I wrote here is correct otherwise I am going to have to rewrite the library again. I'd very much like to get back into RL, but working on the library does take precedence. I've also decided to go over CNTK's source as well. That library strikes me like a pyramid though - tall, humoungous and brittle. But as a ML student my notable weakness is that I do not know any of the libraries, so I might as well see where that path leads.
 
 First though, comes testing.
+
+Edit: Feedforward, convolutional and convolutional with BN nets work correctly. _v1 is ready for operation.
+
+I also tested the library on the unpotimized LSTM and the result have been disappointing. It seems the scheduler is not good enough to extract much concurrency on its own, though I did observe a 10% speedup with 32 streams. Such bad luck. It does seem like I will get more mileage out the union type at any rate.
+
+I can confirm that my idea of how Cuda event synchronization works is pretty much correct. I am sure of it now.

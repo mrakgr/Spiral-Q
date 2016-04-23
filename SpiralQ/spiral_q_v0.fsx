@@ -437,7 +437,7 @@ type ObjectPool() =
         t'.primal_occupied.Clear()
         t'.adjoint_occupied.Clear()
         t'.is_dead <- Undefined
-        if inference_only_flag = false then t'.A.Value.MemsetAsync(0uy,zeroer_str.Stream)
+        if inference_only_flag = false && t'.A.IsSome then t'.A.Value.MemsetAsync(0uy,zeroer_str.Stream)
         t'
 
     member inline t.getd4M (is_constant, (n:int,c:int,h:int,w:int as p)) = t.getd4M (is_constant, [|p|])

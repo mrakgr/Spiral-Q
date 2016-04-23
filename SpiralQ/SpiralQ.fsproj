@@ -60,6 +60,11 @@
     <None Include="spiral_q_v0.fsx" />
     <None Include="event_example.fsx" />
     <None Include="spiral_q_v1.fsx" />
+    <None Include="mnist_example_v4.fsx" />
+    <None Include="batch_normalization_example.fsx" />
+    <None Include="embedded_reber.fsx" />
+    <None Include="rnn_example.fsx" />
+    <Content Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">
@@ -70,6 +75,10 @@
     </Reference>
     <Reference Include="CudaRand">
       <HintPath>..\..\managedCuda\CudaRand\bin\x64\Release\CudaRand.dll</HintPath>
+    </Reference>
+    <Reference Include="FSharp.Charting">
+      <HintPath>..\packages\FSharp.Charting.0.90.14\lib\net40\FSharp.Charting.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="ManagedCuda">
       <HintPath>..\..\managedCuda\ManagedCUDA\bin\Release\ManagedCuda.dll</HintPath>

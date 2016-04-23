@@ -1,6 +1,4 @@
-﻿// I think I finally got all the bugs out. Let me try it. I expect I will be able to break 99% with this.
-
-open System
+﻿open System
 open System.IO
 
 #if INTERACTIVE
@@ -40,41 +38,40 @@ let [|test_images;test_labels;train_images;train_labels|] =
     |> Array.map (fun x -> Path.Combine(__SOURCE_DIRECTORY__,x) |> load_mnist)
 
 
-let l1 = ConvolutionalFeedforwardLayer.createRandomLayer (128,1,5,5) relu
-let l2 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l3 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l4 = ConvolutionalFeedforwardLayer.createRandomLayer (128,128,5,5) relu
-let l5 = ConvolutionalFeedforwardLayer.createRandomLayer (10,128,4,4) clipped_sigmoid
+let l1 = FeedforwardLayer.createRandomLayer (784,2048,1,1) relu :> INNet
+let l2 = FeedforwardLayer.createRandomLayer (2048,2048,1,1) relu :> INNet
+let l3 = FeedforwardLayer.createRandomLayer (2048,2048,1,1) relu :> INNet
+let l4 = FeedforwardLayer.createRandomLayer (2048,10,1,1) clipped_sigmoid :> INNet
 
-let base_nodes = [|l1;l2;l3;l4;l5|] |> Array.collect (fun x -> x.ToArray)
+//let l1 = load_data (IO.Path.Combine(__SOURCE_DIRECTORY__,"weightsl1")) false |> fun x -> FeedforwardLayer.fromArray x relu
+//let l2 = load_data (IO.Path.Combine(__SOURCE_DIRECTORY__,"weightsl2")) false |> fun x -> FeedforwardLayer.fromArray x relu
+//let l3 = load_data (IO.Path.Combine(__SOURCE_DIRECTORY__,"weightsl3")) false |> fun x -> FeedforwardLayer.fromArray x relu
+//let l4 = load_data (IO.Path.Combine(__SOURCE_DIRECTORY__,"weightsl4")) false |> fun x -> FeedforwardLayer.fromArray x clipped_sigmoid
 
-let training_loop label data = // For now, this is just checking if the new library can overfit on a single minibatch.
-    [|
-    defaultConvPar,l1
-    defaultConvPar,l2
-    {defaultConvPar with stride_h=2; stride_w=2},l3
-    defaultConvPar,l4
-    defaultConvPar,l5
-    |] 
-    |> Array.fold (fun x (convPars,layer) -> layer.runLayer (convPars,x)) data
+let base_nodes = [|l1;l2;l3;l4|]
+let base_d4M_nodes = base_nodes |> Array.map (fun x -> x.ToArray) |> Array.concat
+
+let training_loop label data =
+    base_nodes
+    |> Array.fold (fun x layer -> layer.runLayer x) data
     |> fun x -> get_accuracy label x, cross_entropy_cost label x
 
 let learning_rate = 0.03f
 
 let test() =
-    for i=1 to 1 do
+    for i=1 to 10 do
         let mutable er = 0.0f
         for j=0 to train_images.Length-1 do
             let _,r = training_loop train_labels.[j] train_images.[j] // Forward step
             er <- er + r.P.Value.Value
-            printfn "CE cost on the minibatch is %f at batch %i" r.P.Value.Value j
+//            printfn "CE cost on the minibatch is %f at batch %i" r.P.Value.Value j
 
             if r.P.Value.Value |> Single.IsNaN then failwith "Nan!"
 
-            backprop_tape base_nodes r (sgd learning_rate)
+            backprop_tape base_d4M_nodes r (sgd learning_rate)
 
         printfn "-----"
-        printfn "CE cost on the dataset is %f at iteration %i" (er / float32 train_images.Length) i
+        printfn "Squared error cost on the dataset is %f at iteration %i" (er / float32 train_images.Length) i
 
         let mutable acc = 0.0f
         for j=0 to test_images.Length-1 do

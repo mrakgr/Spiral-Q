@@ -3,6 +3,9 @@
 
 module SpiralV3
 
+let mutable inference_only_flag = false
+let use_fast_conv_algos = false
+
 #if INTERACTIVE
 #r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaDNNv5\bin\Release\CudaDNNv5.dll"
 #r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaBlas\bin\x64\Release\CudaBlas.dll"
@@ -261,22 +264,27 @@ type StreamPool(num) =
         let (s,e,a as t) = ar.[p % num]
         t
 
-let StreamPool = new StreamPool(16) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
+// 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance for the batched matrix multiply example. 
+// No difference for feedforward nets of course.
+// Due to that if convolutional nets are running out of memory switch to 1 stream or use less memory
+// consuming algorithms.
+let StreamPool = new StreamPool(128) 
 
 /// Wait for all the event in the occupancy array to finish. Used for the primals on the forward pass.
 let wait_on_all_events (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        occupied_ar |> Seq.iter (fun x -> s.WaitEvent x.Event)
+        for i=0 to occupied_ar.Count-1 do s.WaitEvent occupied_ar.[i].Event
 
 /// Wait for all the event in the occupancy array to finish. Used for the adjoints on the backwards pass.
 let wait_on_last_event (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        occupied_ar |> Seq.last |> fun x -> s.WaitEvent x.Event
+        if occupied_ar.Count > 0 then
+            s.WaitEvent occupied_ar.[occupied_ar.Count-1].Event
 
 let inline nullary_forward_stream_caller
     (s : CudaStream)
     (e : CudaEvent)
     (x : d4MUnion)
     (f : unit -> unit) =
-        wait_on_all_events s x.occupancy
+        wait_on_last_event s x.occupancy
     
         f()
 
@@ -290,8 +298,8 @@ let inline unary_forward_stream_caller
     (output : d4MUnion)
     (f : unit -> unit) =
 
-        wait_on_all_events s input1.occupancy
-        wait_on_all_events s output.occupancy
+        wait_on_last_event s input1.occupancy
+        wait_on_last_event s output.occupancy
 
         f()
 
@@ -306,9 +314,9 @@ let inline binary_forward_stream_caller
     (output : d4MUnion)
     (f : unit -> unit) =
 
-        wait_on_all_events s input1.occupancy
-        wait_on_all_events s input2.occupancy
-        wait_on_all_events s output.occupancy
+        wait_on_last_event s input1.occupancy
+        wait_on_last_event s input2.occupancy
+        wait_on_last_event s output.occupancy
 
         f()
 
@@ -324,10 +332,10 @@ let inline trinary_forward_stream_caller
     (output : d4MUnion)
     (f : unit -> unit) =
 
-        wait_on_all_events s input1.occupancy
-        wait_on_all_events s input2.occupancy
-        wait_on_all_events s input3.occupancy
-        wait_on_all_events s output.occupancy
+        wait_on_last_event s input1.occupancy
+        wait_on_last_event s input2.occupancy
+        wait_on_last_event s input3.occupancy
+        wait_on_last_event s output.occupancy
 
         f()
 
@@ -457,7 +465,6 @@ type ConvolutionDescriptor with
         t.GetConvolution2dForwardOutputDim(s,f,&n,&c,&h,&w)
         n,c,h,w
 
-let mutable inference_only_flag = false
 /// The new object pool. Zeroes out the adjoints concurrently on the forward phase.
 type ObjectPool() =
     let zeroer_str = new CudaStream()
@@ -514,7 +521,7 @@ type ObjectPool() =
         t'.ReplaceIf p
         t'.occupancy.Clear()
         t'.is_dead <- Undefined
-        if inference_only_flag = false then t'.A.Value.MemsetAsync(0uy,zeroer_str.Stream)
+        if inference_only_flag = false && t'.A.IsSome then t'.A.Value.MemsetAsync(0uy,zeroer_str.Stream)
         t'
 
     member inline t.getd4M (is_constant, (n:int,c:int,h:int,w:int as p)) = t.getd4M (is_constant, [|p|])
@@ -1041,7 +1048,7 @@ type DeviceMaxColumnActivationModule() =
     let kernel = load_kernel kernel_code kernel_name
 
     member t.A(((n : int,c : int,h,w as x_nchw), x: CUdeviceptr), (o_nchw, o: CUdeviceptr), s) =
-        if x_nchw <> o_nchw then failwith "x_nchw <> o_nchw"
+        if x_nchw <> o_nchw then failwithf "x_nchw(%A) <> o_nchw(%A)" x_nchw o_nchw
         let m = c*h*w
 
         kernel.GridDimensions <- dim3(n)
@@ -1140,9 +1147,9 @@ let inline deadness_check (c : d4MUnion) (a : d4MUnion) (f : unit -> unit) =
         | Undefined -> a.is_dead <- Dead
         | Dead | Alive -> () // If the bottom node is Alive do not modify it to be Dead as there exists a path from elsewhere through it.
     | Alive -> 
-        f()
         a.is_dead <- Alive
-
+        f()
+        
 /// Matrix-matrix multiply.
 let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4MUnion) =
     let c = 
@@ -1339,7 +1346,10 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
     let _ =
         let s,e,workspace = StreamPool.P
         let algo = 
-            cudnn.GetConvolutionForwardAlgorithm(srcTensorDesc,filterDesc,convDesc,dstTensorDesc,cudnnConvolutionFwdPreference.SpecifyWorkspaceLimit,SizeT 30000)
+            if use_fast_conv_algos then
+                cudnn.GetConvolutionForwardAlgorithm(srcTensorDesc,filterDesc,convDesc,dstTensorDesc,cudnnConvolutionFwdPreference.PreferFastest,SizeT 0)
+            else
+                cudnn.GetConvolutionForwardAlgorithm(srcTensorDesc,filterDesc,convDesc,dstTensorDesc,cudnnConvolutionFwdPreference.SpecifyWorkspaceLimit,SizeT 30000)
         let _ = 
             cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) |> int
             |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
@@ -1359,7 +1369,10 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
         let convolution_backwards_filter () =
             let s,e,workspace = StreamPool.P
             let algo = 
-                cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.SpecifyWorkspaceLimit,SizeT 30000)
+                if use_fast_conv_algos then
+                    cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.PreferFastest,SizeT 0)
+                else
+                    cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.SpecifyWorkspaceLimit,SizeT 30000)
             let _ =
                 cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) |> int
                 |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
@@ -1376,7 +1389,10 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
         let convolution_backwards_data () =
             let s,e,workspace = StreamPool.P
             let algo = 
-                cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.SpecifyWorkspaceLimit,SizeT 30000)
+                if use_fast_conv_algos then
+                    cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.PreferFastest,SizeT 0)
+                else
+                    cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.SpecifyWorkspaceLimit,SizeT 30000)
             let _ =
                 cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) |> int
                 |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
@@ -1556,8 +1572,12 @@ let scale (alpha: float32) (a:Df) =
 
 let sum_scalars (a:Df[]) =
     let c = Df.create 0.0f
-
-    for l in a do c.P := lazy (c.P.Value.Value + l.P.Value.Value)
+    c.P :=
+        lazy 
+            let mutable t = 0.0f
+            for l in a do 
+                t <- t + l.P.Value.Value
+            t
     
     let sum_scalars_backwards () = for l in a do l.A := !c.A + !l.A
     tape.Push sum_scalars_backwards
@@ -1709,10 +1729,12 @@ let cross_entropy_cost target activations =
 let maxColumnActivationModule = lazy new DeviceMaxColumnActivationModule()
 let accuracyModule = lazy new DeviceBinaryMapSumModule("(x*y == 0.0f) ? 0.0f : 1.0f;","Accuracy")
 let get_accuracy (targets : d4MUnion) (activations : d4MUnion) =
-    let s,e,o = StreamPool.P
-    o.ReplaceIf(targets.nchw)
-    maxColumnActivationModule.Value.A(activations.P',o.P',s.Stream)
-    accuracyModule.Value.A(targets.P',o.P',s.Stream)
+    lazy
+        let s,e,o = StreamPool.P
+        o.ReplaceIf(targets.nchw)
+        wait_on_all_events s activations.occupancy
+        maxColumnActivationModule.Value.A(activations.P',o.P',s.Stream)
+        accuracyModule.Value.A(targets.P',o.P',s.Stream).Value
 
 let find_max_index (action_values : float32[]) =
     let mutable max = Single.NegativeInfinity
@@ -2108,7 +2130,6 @@ type LSTMLayer =
     member l.runLayerNoH (x:d4MUnion) =
         let block_input = linear_layer_matmult [|l.W_z,x|] (Some l.b_z) |> l.block_input_a
         let input_gate = linear_layer_matmult [|l.W_i,x|] (Some l.b_i) |> sigmoid
-        let forget_gate = linear_layer_matmult [|l.W_f,x|] (Some l.b_f) |> sigmoid
         let c' = hadmult block_input input_gate
         let output_gate = linear_layer_matmult [|l.W_o,x;l.P_o,c'|] (Some l.b_o) |> sigmoid
         hadmult (l.block_output_a c') output_gate, c'
