@@ -55,8 +55,11 @@
     <None Include="test_v0%27.fsx" />
     <None Include="test_v1.fsx" />
     <None Include="callback_example.fsx" />
-    <Compile Include="spiral_q_v0.fs" />
-    <Compile Include="test_v0.fs" />
+    <None Include="test_v0.fsx" />
+    <None Include="test_v2.fsx" />
+    <None Include="spiral_q_v0.fsx" />
+    <None Include="event_example.fsx" />
+    <None Include="spiral_q_v1.fsx" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">

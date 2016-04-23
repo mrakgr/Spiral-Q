@@ -17,7 +17,7 @@ open System
 open System.IO
 
 #if INTERACTIVE
-#load "spiral_q_v0.fs"
+#load "spiral_q_v0.fsx"
 #endif
 open SpiralV3
 open ManagedCuda

@@ -42,6 +42,7 @@ type StreamPool(num) =
         t
 
 let StreamPool = new StreamPool(1024) // 8 < 16 > 32 > 64 > 128 > 1024 in terms of performance.
+let logger = Text.StringBuilder(10000)
 
 // Set the Cuda libraries handles to the above stream.
 let cublas = CudaBlas(PointerMode.Host,AtomicsMode.Allowed) // Better performance for some solver functions with atomics allowed. The Spiral library does not use them though.
@@ -104,7 +105,8 @@ type Df =
 
 /// Wait for all the event in the occupancy array to finish.
 let wait_on_event (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        occupied_ar |> Seq.iter (fun x -> s.WaitEvent x.Event)
+        occupied_ar
+        |> Seq.iter (fun x -> s.WaitEvent x.Event)
 
 /// Projects nchw dimensions to a row, column dimension according to the following formula:
 /// row = c*h*w
@@ -493,7 +495,7 @@ let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> uni
     ObjectPool.ResetOccupancy() // This step is a good one to make here.
     while tape.Count > 0 do
         tape.Pop()()
-    ctx.Synchronize()
+        //ctx.Synchronize()
     base_nodes |> Array.iter update
     ObjectPool.ResetOccupancy()
 
@@ -1198,14 +1200,20 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
 
 let matmult (a: d4MUnion) (b:d4MUnion) = matmult' None (a, b) |> fun x -> x.Value
 
-let inline private cudnn_unary_stream_function input_occ output_occ (f : unit -> unit) =
+let inline private cudnn_unary_stream_function input_occ output_occ (callback_pre : (unit -> unit) option) (callback_post : (unit -> unit) option) (f : unit -> unit) =
     let s,e = StreamPool.P
     cudnn.SetStream(s)
     
     wait_on_event s input_occ
     wait_on_event s output_occ
 
+    match callback_pre with
+    | None -> ()
+    | Some x -> add_callback_to_stream s x
     f()
+    match callback_post with
+    | None -> ()
+    | Some x -> add_callback_to_stream s x
 
     e.Record s.Stream
     output_occ.Add e
@@ -1243,7 +1251,7 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
             left
 
     if left_nchw <> right_nchw then
-        cudnn_unary_stream_function right.primal_occupied output.primal_occupied 
+        cudnn_unary_stream_function right.primal_occupied output.primal_occupied None None
         <| fun _ -> cudnn.AddTensor(beta,rightDesc,right.P,alpha,leftDesc,output.P) // Add right to output.
     else geam nT nT beta right.P' alpha output.P' output.P'
 
@@ -1255,6 +1263,8 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
                     saxpy beta output.A' right.A'
                 else
                     cudnn_unary_stream_function output.adjoint_occupied right.adjoint_occupied
+                    <| Some (fun _ -> "Starting tensor_add_right_backwards..." |> logger.Append |> ignore )
+                    <| Some (fun _ -> "Ending tensor_add_right_backwards..." |> logger.Append |> ignore)
                     <| fun _ -> cudnn.ConvolutionBackwardBias(beta,leftDesc,output.A.Value,1.0f,rightDesc,right.A.Value)
         tape.Push(tensor_add_right_backwards)
 
@@ -1282,14 +1292,16 @@ let activation_forward mode (input : d4MUnion)  =
 
     let output = ObjectPool.getd4M (false, input_sizes)
 
-    cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+    cudnn_unary_stream_function input.primal_occupied output.primal_occupied None None
     <| fun _ -> cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
 
     if input.A.IsSome then 
         let activation_backward () =
             deadness_check output input 
             <| fun _ -> 
-                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied None None
+//                <| Some (fun _ -> printfn "Starting activation_backward...")
+//                <| Some (fun _ -> printfn "Ending activation_backward...")
                 <| fun _ -> cudnn.ActivationBackward(mode,1.0f,srcTensorDesc,output.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.P,1.0f,srcTensorDesc,input.A.Value)
         tape.Push(activation_backward)
     output
@@ -1305,14 +1317,14 @@ let pooling_forward p (input : d4MUnion) =
 
     let dstTensorDesc = ObjectPool.getTensorDescriptor dest_sizes
 
-    cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+    cudnn_unary_stream_function input.primal_occupied output.primal_occupied None None
     <| fun _ -> cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,input.P,0.0f,dstTensorDesc,output.P)
 
     if input.A.IsSome then 
         let pooling_backward () =
             deadness_check output input 
             <| fun _ ->
-                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied None None
                 <| fun _ -> cudnn.PoolingBackward(poolingDescriptor,1.0f,srcTensorDesc,output.P,srcTensorDesc,
                                       output.A.Value,dstTensorDesc,input.P,1.0f,dstTensorDesc,input.A.Value)
         tape.Push(pooling_backward)
@@ -1359,7 +1371,9 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
                 |> ObjectPool.getWorkspace
             deadness_check output filter 
             <| fun _ ->
-                cudnn_unary_stream_function output.adjoint_occupied filter.adjoint_occupied
+                cudnn_unary_stream_function output.adjoint_occupied filter.adjoint_occupied None None
+//                <| Some (fun _ -> printfn "Starting convolution_backwards_filter...")
+//                <| Some (fun _ -> printfn "Ending convolution_backwards_filter...")
                 <| fun _ -> cudnn.ConvolutionBackwardFilter(1.0f,srcTensorDesc,data.P,dstTensorDesc,output.A.Value,convDesc,algo,workspace,1.0f,filterDesc,filter.A.Value)
         tape.Push(convolution_backwards_filter)
 
@@ -1372,6 +1386,8 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
             deadness_check output data 
             <| fun _ ->
                 cudnn_unary_stream_function output.adjoint_occupied data.adjoint_occupied
+                <| Some (fun _ -> "Starting convolution_backwards_data..." |> logger.Append |> ignore)
+                <| Some (fun _ -> "Ending convolution_backwards_data..." |> logger.Append |> ignore)
                 <| fun _ -> cudnn.ConvolutionBackwardData(1.0f,filterDesc,filter.P,dstTensorDesc,output.A.Value,convDesc,1.0f,algo,workspace,srcTensorDesc,data.A.Value)
         tape.Push(convolution_backwards_data)
 
@@ -1388,6 +1404,7 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
     let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
 
     let bnDesc = 
+        //bnBias.nchw |> ObjectPool.getTensorDescriptor
         ObjectPool.getBNDescriptor (input_sizes, bnMode, srcTensorDesc)
 
     let _ =
@@ -1406,22 +1423,22 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
     let output = ObjectPool.getd4M (false,input_sizes)
 
     if do_inference = false then
-        cudnn_unary_stream_function input.primal_occupied output.primal_occupied
+        cudnn_unary_stream_function input.primal_occupied output.primal_occupied None None
         <| fun _ -> cudnn.BatchNormalizationForwardTraining(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,exponentialAverageFactor,bnRunningMean.P,bnRunningVariance.P,epsilon,bnSavedMean.P,bnSavedVariance.P)
         if input.A.IsSome then 
             let batch_normalization_backward () =
                 let dx_alpha, dx_beta = 1.0f, 1.0f
                 let param_alpha, param_beta = 1.0f, 1.0f
 
-                deadness_check output input 
+                deadness_check output input
                 <| fun _ ->
-                    cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied
+                    cudnn_unary_stream_function output.adjoint_occupied input.adjoint_occupied None None
                     <| fun _ -> cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
                 
             tape.Push batch_normalization_backward
     else
-            cudnn_unary_stream_function input.primal_occupied output.primal_occupied
-            <| fun _ -> cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
+        cudnn_unary_stream_function input.primal_occupied output.primal_occupied None None
+        <| fun _ -> cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
         
     output
     
