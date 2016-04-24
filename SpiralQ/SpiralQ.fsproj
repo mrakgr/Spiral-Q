@@ -65,6 +65,9 @@
     <None Include="embedded_reber.fsx" />
     <None Include="rnn_example.fsx" />
     <Content Include="packages.config" />
+    <None Include="linear_layer_test.fsx" />
+    <None Include="wavefront_iteration_example.fsx" />
+    <None Include="spiral_q_v2.fsx" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">

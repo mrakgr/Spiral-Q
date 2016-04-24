@@ -1,10 +1,13 @@
 ﻿// Basic reverse mode AD on the GPU. This v3 of Spiral is focused on the union type and automatic parallelization. Uses the cuDNN v5 RC.
 // It has come a long way since v1.
 
+// Hopefully this will be the last rewrite.
+
 module SpiralV3
 
 let mutable inference_only_flag = false
 let use_fast_conv_algos = false
+let stream_num = 32
 
 #if INTERACTIVE
 #r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaDNNv5\bin\Release\CudaDNNv5.dll"
@@ -101,7 +104,12 @@ type DeadFlagType =
 | Dead
 | Alive
 
-type d4MUnion =
+type StreamStateType =
+| Static
+| Unpassed of CudaStream * CudaEvent * d4MUnion
+| Passed of CudaStream * CudaEvent * d4MUnion
+
+and d4MUnion =
     {
     mutable elements_size : (int * int * int * int)[]
     mutable elements_primal : CUdeviceptr[] // These pointer arrays should be in page locked memory, but I'll keep this as is for now.
@@ -109,7 +117,7 @@ type d4MUnion =
     mutable P: CudaDeviceVariable<float32> // primal
     mutable A: CudaDeviceVariable<float32> option // adjoint
     mutable is_dead : DeadFlagType // flag to skip backprop
-    mutable occupancy : ResizeArray<CudaEvent>
+    mutable stream_state : StreamStateType
     }  
 
     static member ar_scan (ar : (int * int * int * int)[]) = ar |> Array.scan (fun state e -> state + sizeof<float32> * size_nchw e) 0
@@ -131,14 +139,13 @@ type d4MUnion =
                 |]
         | None -> [||]
         
-
     static member create' (ar : (int * int * int * int)[], is_constant) =
         let l = d4MUnion.ar_scan ar
         let p,a = l |> Array.last |> fun x -> x / sizeof<float32> |> SizeT |> fun x -> new CudaDeviceVariable<float32>(x), if is_constant = false then new CudaDeviceVariable<float32>(x) |> Some else None
         let elements_size, elements_primal, elements_adjoint = d4MUnion.make_elements p a ar l
-        
+
         {elements_size = elements_size; elements_primal=elements_primal; elements_adjoint=elements_adjoint; 
-        P=p; A=a; is_dead=Undefined; occupancy = ResizeArray()}
+        P=p; A=a; is_dead=Undefined; stream_state = Static}
 
     static member create' (ar_data : ((int * int * int * int) * float32[]) [], is_constant) =
         let ar, data = Array.unzip ar_data
@@ -268,131 +275,42 @@ type StreamPool(num) =
 // No difference for feedforward nets of course.
 // Due to that if convolutional nets are running out of memory switch to 1 stream or use less memory
 // consuming algorithms.
-let StreamPool = new StreamPool(32) 
+// Optimized Linear layers require one or more stream and will throw an exception if not enough of them are allocated.
+let StreamPool = new StreamPool(stream_num) 
 
-/// Wait for all the event in the occupancy array to finish. Used for the primals on the forward pass.
-let wait_on_all_events (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        for i=0 to occupied_ar.Count-1 do s.WaitEvent occupied_ar.[i].Event
-
-/// Wait for all the event in the occupancy array to finish. Used for the adjoints on the backwards pass.
-let wait_on_last_event (s : CudaStream) (occupied_ar : ResizeArray<CudaEvent>) =
-        if occupied_ar.Count > 0 then
-            s.WaitEvent occupied_ar.[occupied_ar.Count-1].Event
-
-let inline nullary_forward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (x : d4MUnion)
-    (f : unit -> unit) =
-        wait_on_last_event s x.occupancy
+let nullary_backward_stream_caller (x : d4MUnion) (f : CudaStream -> unit) =
+    match x.stream_state with
+    | Static ->
+        let s,e,_ as sem = StreamPool.P
+        x.stream_state <- Unpassed sem
+        f s
+        e.Record s.Stream
+    | Unpassed(s,e,_) | Passed(s,e,_) ->
+        f s
+        e.Record s.Stream
     
-        f()
-
-        e.Record s.Stream
-        x.occupancy.Add e
-
-let inline unary_forward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (input1 : d4MUnion)
-    (output : d4MUnion)
-    (f : unit -> unit) =
-
-        wait_on_last_event s input1.occupancy
-        wait_on_last_event s output.occupancy
-
-        f()
-
-        e.Record s.Stream
-        output.occupancy.Add e
-
-let inline binary_forward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (input1 : d4MUnion)
-    (input2 : d4MUnion)
-    (output : d4MUnion)
-    (f : unit -> unit) =
-
-        wait_on_last_event s input1.occupancy
-        wait_on_last_event s input2.occupancy
-        wait_on_last_event s output.occupancy
-
-        f()
-
-        e.Record s.Stream
-        output.occupancy.Add e
-
-let inline trinary_forward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (input1 : d4MUnion)
-    (input2 : d4MUnion)
-    (input3 : d4MUnion)
-    (output : d4MUnion)
-    (f : unit -> unit) =
-
-        wait_on_last_event s input1.occupancy
-        wait_on_last_event s input2.occupancy
-        wait_on_last_event s input3.occupancy
-        wait_on_last_event s output.occupancy
-
-        f()
-
-        e.Record s.Stream
-        output.occupancy.Add e
-
-let inline nullary_backward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (input : d4MUnion)
-    (f : unit -> unit) =
-
-        wait_on_last_event s input.occupancy
-
-        f()
-
-        e.Record s.Stream
-        input.occupancy.Add e
-
-let inline backward_stream_caller
-    (s : CudaStream)
-    (e : CudaEvent)
-    (output : d4MUnion)
-    (input : d4MUnion)
-    (f : unit -> unit) =
-
-        wait_on_last_event s output.occupancy
-        wait_on_last_event s input.occupancy
-
-        f()
-
-        e.Record s.Stream
-        input.occupancy.Add e
-
-
 type d4MUnion with
     /// Sets the adjoint to zero.
     member inline t.setZeroAdjoint() = 
         match t.A with
         | Some A -> 
             let s,e,_ = StreamPool.P
-            nullary_backward_stream_caller s e t
-            <| fun _ -> A.MemsetAsync(0u,s.Stream)
+            nullary_backward_stream_caller t
+            <| fun s -> A.MemsetAsync(0u,s.Stream)
         | None -> ()
 
     /// Sets the primal to zero.
     member inline t.setZeroPrimal() = 
         let s,e,_ = StreamPool.P
-        nullary_backward_stream_caller s e t
-        <| fun _ -> t.P.MemsetAsync(0u,s.Stream)
+        nullary_backward_stream_caller t
+        <| fun s -> t.P.MemsetAsync(0u,s.Stream)
 
     /// Set the matrix to a value.
     member inline t.setPrimal (x: float32) = 
         let v = BitConverter.ToUInt32(BitConverter.GetBytes(x),0)
         let s,e,_ = StreamPool.P
-        nullary_backward_stream_caller s e t
-        <| fun _ -> t.P.MemsetAsync(v,s.Stream)
+        nullary_backward_stream_caller t
+        <| fun s -> t.P.MemsetAsync(v,s.Stream)
 
 let gather_pointer (nchw, p) =
     let size = size_nchw nchw
@@ -498,20 +416,6 @@ type ObjectPool() =
             pool.Add(k, t)
             t
 
-//    member t.getWorkspace n = 
-//        if n > 0 then
-//            let t' = 
-//                ObjectPool.getFromPool workspacePool wp 
-//                <| (fun _ -> 
-//                    new_dev<byte> n)
-//            if int t'.Size < n then // Resize the object if less than n
-//                t'.Dispose()
-//                let t'' = new_dev<byte> n
-//                workspacePool.[!wp-1] <- t''
-//                t''
-//            else t'
-//        else CudaDeviceVariable.Null
-    
     member t.getd4M (is_constant, (nchw : (int*int*int*int)[] as p)) =
         let t' = 
             match is_constant with
@@ -519,7 +423,7 @@ type ObjectPool() =
             | true -> ObjectPool.getFromPool d4MPool d4Mp (fun _ -> d4MUnion.createConstant p)
 
         t'.ReplaceIf p
-        t'.occupancy.Clear()
+        t'.stream_state <- Static
         t'.is_dead <- Undefined
         if inference_only_flag = false && t'.A.IsSome then t'.A.Value.MemsetAsync(0uy,zeroer_str.Stream)
         t'
@@ -548,28 +452,25 @@ type ObjectPool() =
     member t.ResetPointers() =
         d4Mp := 0
 
-    /// Resets the occupancy arrays of all the objects in the pool and sets the pointers to zero.
-    /// Blocks the device and also, triggers .NET GC because why not?
-    member t.ResetOccupancy() =
-        for i=0 to d4MPool.Count-1 do
-            d4MPool.[i].occupancy.Clear()
-        StreamPool.ResetPointer()
-        t.ResetPointers()
-        ctx.Synchronize()
+    /// Resets the stream state of all the objects in the pool.
+    member t.ResetStreamState () =
+        for x in d4MPool do x.stream_state <- Static
 
 let ObjectPool = new ObjectPool() // In the past iteration of the library, the object pool's role was taken by the tape. Not anymore.
 
 let tape = new Stack<(unit -> unit)>(1000) // Nice and simple way of passing in the closures for the backprop step.
 
 let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> unit) =
-    base_nodes |> Array.iter (fun x -> x.setZeroAdjoint())
+    for x in base_nodes do x.setZeroAdjoint(); x.stream_state <- Static; x.is_dead <- Undefined
+    ObjectPool.ResetStreamState()
+    ctx.Synchronize()
+
     top.A := 1.0f
-    ObjectPool.ResetOccupancy() // This step is a good one to make here.
     while tape.Count > 0 do
         tape.Pop()()
     base_nodes |> Array.iter update
-    base_nodes |> Array.iter (fun x -> x.occupancy.Clear())
-    ObjectPool.ResetOccupancy()
+    for x in base_nodes do x.stream_state <- Static; x.is_dead <- Undefined
+    ctx.Synchronize()
 
 let inline divup a b = (a-1)/b+1 // Integer division with rounding up. (a+b-1)/b is another variant on this.
 
@@ -1150,7 +1051,86 @@ let inline deadness_check (c : d4MUnion) (a : d4MUnion) (f : unit -> unit) =
     | Alive -> 
         a.is_dead <- Alive
         f()
-        
+
+let binary_forward_stream_matcher (a : d4MUnion) (b : d4MUnion) (c : d4MUnion) = 
+    match c.stream_state with
+    | Passed _ -> failwith "This function should never be called on a Passed node in the output. The forward pass is out of order."
+    | Static ->
+        match a.stream_state, b.stream_state with
+        | Static, Static -> 
+            let s,e,_ as sem = StreamPool.P
+            c.stream_state <- Unpassed sem
+            sem
+        | Unpassed (s,e,m), Static ->
+            a.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s,e,m
+        | Static, Unpassed (s,e,m) ->  
+            b.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s,e,m
+        | Unpassed (s,e,m), Unpassed(s',e',m') -> 
+            a.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s.WaitEvent e'.Event
+            s,e,m
+        | Passed (s',e',m'), Unpassed (s,e,m) ->
+            b.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s.WaitEvent e'.Event
+            s,e,m
+        | Unpassed (s,e,m), Passed (s',e',m') ->  
+            a.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s.WaitEvent e'.Event
+            s,e,m
+        | Passed (s',e',m'), Passed (s'',e'',m'') ->
+            let s,e,m as sem = StreamPool.P
+            c.stream_state <- Unpassed sem
+            s.WaitEvent e'.Event
+            s.WaitEvent e''.Event
+            sem
+        | Passed(s',e',m'), Static | Static, Passed(s',e',m') ->
+            let s,e,_ as sem = StreamPool.P
+            c.stream_state <- Unpassed sem
+            s.WaitEvent e'.Event
+            sem
+    | Unpassed(s,e,m) -> 
+        let match_function =
+            function
+            | Passed(s',e',m') | Unpassed(s',e',m') ->
+                s.WaitEvent e'.Event
+            | Static -> ()
+        match_function a.stream_state
+        match_function b.stream_state
+        s,e,m
+
+let backward_stream_matcher (c : d4MUnion) (a : d4MUnion) =
+    match c.stream_state, a.stream_state with
+    | _, Passed _ -> failwith "This function should not be called on a Passed node. Backwards pass is out of order."
+    | Static, Static ->
+        let s,e,_ as sem = StreamPool.P
+        a.stream_state <- Unpassed sem
+        sem
+    | Unpassed(s,e,m), Static ->
+        c.stream_state <- Passed(s,e,m)
+        a.stream_state <- Unpassed(s,e,m)
+        s,e,m
+    | Passed(s',e',m'), Static ->
+        let s,e,_ as sem = StreamPool.P
+        a.stream_state <- Unpassed sem
+        s.WaitEvent e'.Event
+        sem
+    | Static, Unpassed(s,e,m) ->
+        s,e,m
+    | Unpassed(s',e',m'), Unpassed(s,e,m) ->
+        a.stream_state <- Passed(s',e',m')
+        s.WaitEvent e'.Event
+        s,e,m
+    | Passed(s',e',m'), Unpassed(s,e,m) ->
+        s.WaitEvent e'.Event
+        s,e,m
+
 /// Matrix-matrix multiply.
 let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4MUnion) =
     let c = 
@@ -1160,17 +1140,17 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
             let _,num_cols = b.rc
             ObjectPool.getd4M (false, (num_cols,num_rows,1,1))
             |> fun c ->
-                let s,e,_ = StreamPool.P
+                let s,e,_ = binary_forward_stream_matcher a b c
 
-                binary_forward_stream_caller s e a b c
-                <| fun _ -> gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
+                gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
+                e.Record s.Stream
 
                 c
         | Some c ->
-            let s,e,_ = StreamPool.P
+            let s,e,_ = binary_forward_stream_matcher a b c
 
-            binary_forward_stream_caller s e a b c
-            <| fun _ -> gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
+            gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
+            e.Record s.Stream
 
             c
 
@@ -1178,49 +1158,22 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
         let matmult_backward_left () = 
             deadness_check c a 
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
+                let s,e,_ = backward_stream_matcher c a
 
-                backward_stream_caller s e c a 
-                <| fun _ -> gemm nT T 1.0f c.A' b.P' 1.0f a.A' s.Stream
+                gemm nT T 1.0f c.A' b.P' 1.0f a.A' s.Stream
+                e.Record s.Stream
 
         tape.Push(matmult_backward_left)
     if b.A.IsSome then 
         let matmult_backward_right () = 
             deadness_check c b <| fun _ -> 
-                let s,e,_ = StreamPool.P
+                let s,e,_ = backward_stream_matcher c b
 
-                backward_stream_caller s e c b
-                <| fun _ -> gemm T nT 1.0f a.P' c.A' 1.0f b.A' s.Stream
+                gemm T nT 1.0f a.P' c.A' 1.0f b.A' s.Stream
+                e.Record s.Stream
 
         tape.Push(matmult_backward_right)
     Some c
-
-/// Matrix-matrix multiply.
-/// s,e,_ tuple is passed into it.
-let inline matmult's ((a,b): d4MUnion*d4MUnion) (s : CudaStream,e : CudaEvent,_ as sem, prev_output : d4MUnion option) =
-    let c = 
-        match prev_output with
-        | None ->
-            let num_rows,_ = a.rc
-            let _,num_cols = b.rc
-            ObjectPool.getd4M (false, (num_cols,num_rows,1,1))
-            |> fun c ->
-                gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
-
-                e.Record s.Stream
-                c.occupancy.Add e
-
-                c
-        | Some c ->
-            gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
-
-            e.Record s.Stream
-            c.occupancy.Add e
-
-            c
-
-    sem, Some c
-
 
 let matmult (a: d4MUnion) (b:d4MUnion) = matmult' None (a, b) |> fun x -> x.Value
 
@@ -2213,3 +2166,4 @@ let load_data file_name is_constant =
         |]
 
     weights
+

@@ -36,3 +36,11 @@ Edit: Feedforward, convolutional and convolutional with BN nets work correctly. 
 I also tested the library on the unpotimized LSTM and the result have been disappointing. It seems the scheduler is not good enough to extract much concurrency on its own, though I did observe a 10% speedup with 32 streams. Such bad luck. It does seem like I will get more mileage out the union type at any rate.
 
 I can confirm that my idea of how Cuda event synchronization works is pretty much correct. I am sure of it now.
+
+UPDATE 4/24/2016: I have to do yet another rewrite. The Cuda scheduler is quite poor and in the linear_layer_test.fsx, I've verified that concurrency works much better when the streams are reused. Tsk.
+
+If I had to make a wish in cuDNN I would like if they could make optimized linear layers. Currently one optimization I could not do myself would be to have gemm do atomic adds to the output arrays. That would be greatly helpful. I really do not feel like allocating temporary arrays for the linear layer.
+
+Hopefully this will be the last rewrite. I think I have a full idea of how to do automatic concurrency efficiently now, though this is hardly the end of optimization. The trouble with concurrent (and parallel) programming is that for a given problem, changing the inputs changes the structure of the problem. An AI working at 1000x speed of meat brain would have a strong advantage in getting the most juice out of available hardware. It is annoying to be the biggest bottleneck in programming.
+
+With any luck, when I scale up the RNNs in depth and multiple dimensions, the benefits of what I am doing now will become clear. Out of all the optimizations, [the wavefront iteration](https://devblogs.nvidia.com/parallelforall/optimizing-recurrent-neural-networks-cudnn-5/) from the linked post might be the easiest one to do. A simple and general, if relatively inneficient way of doing it would be to store all the (i,j) tuples in an array and sort them by Manhattan distance from (0,0).
