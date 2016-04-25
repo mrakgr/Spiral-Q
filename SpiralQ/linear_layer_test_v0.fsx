@@ -29,7 +29,7 @@ let t =
 let unoptimized_lin_layer_test() =
     let stopwatch = Diagnostics.Stopwatch.StartNew()
     for i= 1 to 10 do
-        // So it is 7.62 (1 stream) vs 0.508 (32 streams.)
+        // So it is 0.762 (1 stream) vs 0.508 (32 streams.)
         t |> Array.map (fun x -> linear_layer_matmult x None |> sigmoid |> sigmoid |> sigmoid) |> ignore
         ObjectPool.ResetOccupancy()
         tape.Clear()
@@ -39,7 +39,7 @@ let unoptimized_lin_layer_test() =
 let unoptimized_lin_layer_test2() =
     let stopwatch = Diagnostics.Stopwatch.StartNew()
     for i= 1 to 10 do
-        // So it is 7.62 (1 stream) vs 0.305 (32 streams.)
+        // So it is 0.762 (1 stream) vs 0.305 (32 streams.)
         // It turns out that all that waiting chokes the scheduler. Shit.
         t |> Array.map (fun x -> 
             let [|a1;a2;a3|] = x

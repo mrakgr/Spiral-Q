@@ -459,6 +459,11 @@ type ObjectPool() =
     member t.ResetStreamState () =
         for x in d4MPool do x.stream_state <- Static
 
+    /// Resets the stream state of all the objects in the pool and the pointers as well.
+    member t.ResetStreamStateAndPointers () =
+        t.ResetStreamState()
+        t.ResetPointers()
+
 let ObjectPool = new ObjectPool() // In the past iteration of the library, the object pool's role was taken by the tape. Not anymore.
 
 let tape = new Stack<(unit -> unit)>(1000) // Nice and simple way of passing in the closures for the backprop step.
@@ -473,6 +478,7 @@ let backprop_tape (base_nodes : d4MUnion[]) (top : Df) (update : d4MUnion -> uni
         tape.Pop()()
     base_nodes |> Array.iter update
     for x in base_nodes do x.stream_state <- Static; x.is_dead <- Undefined
+    ObjectPool.ResetPointers()
     ctx.Synchronize()
 
 let inline divup a b = (a-1)/b+1 // Integer division with rounding up. (a+b-1)/b is another variant on this.
@@ -1195,7 +1201,7 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
     if b.A.IsSome then 
         let matmult_backward_right () = 
             deadness_check c b <| fun _ -> 
-                backward_stream_caller c a
+                backward_stream_caller c b
                 <| fun s e m -> gemm T nT 1.0f a.P' c.A' 1.0f b.A' s.Stream
 
         tape.Push(matmult_backward_right)

@@ -48,3 +48,7 @@ With any luck, when I scale up the RNNs in depth and multiple dimensions, the be
 UPDATE 4/25/2016: Done with the third rewrite. Time for testing.
 
 I also figured out how to do the wavefront iteration in an elegant fashion without the need for sorting for an arbitrary number of dimensions. It might not be necessarily more efficient though when all is said and done. It is in the `wavefront_iteration_example.fsx`.
+
+Edit: Done with testing. Found and fixed a bug in the `matmult'` function. Just like previously I haven't had any luck with extracting more from the unoptimized LSTM with this. It does bring out the full potential in the `linear_layer_test_v1.fsx` which is a synthetic benchmark. It terms of automating concurrency, I can't do much more than this for the library. I learned quite a bit about Cuda concurrency from this.
+
+Next step - optimized linear layer.

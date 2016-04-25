@@ -56,18 +56,22 @@
     <None Include="test_v1.fsx" />
     <None Include="callback_example.fsx" />
     <None Include="test_v0.fsx" />
-    <None Include="test_v2.fsx" />
     <None Include="spiral_q_v0.fsx" />
     <None Include="event_example.fsx" />
     <None Include="spiral_q_v1.fsx" />
     <None Include="mnist_example_v4.fsx" />
     <None Include="batch_normalization_example.fsx" />
     <None Include="embedded_reber.fsx" />
-    <None Include="rnn_example.fsx" />
+    <None Include="rnn_example_v0.fsx" />
     <Content Include="packages.config" />
-    <None Include="linear_layer_test.fsx" />
+    <None Include="linear_layer_test_v0.fsx" />
     <None Include="wavefront_iteration_example.fsx" />
     <None Include="spiral_q_v2.fsx" />
+    <None Include="linear_layer_test_v1.fsx" />
+    <None Include="rnn_example_v1.fsx" />
+    <None Include="test_v3.fsx" />
+    <None Include="mnist_example_v5.fsx" />
+    <None Include="optimized_linear_layer_v0.fsx" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">
