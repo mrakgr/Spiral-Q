@@ -66,11 +66,11 @@
     <Content Include="packages.config" />
     <None Include="linear_layer_test_v0.fsx" />
     <None Include="wavefront_iteration_example.fsx" />
-    <None Include="spiral_q_v2.fsx" />
     <None Include="linear_layer_test_v1.fsx" />
     <None Include="rnn_example_v1.fsx" />
     <None Include="test_v3.fsx" />
     <None Include="mnist_example_v5.fsx" />
+    <None Include="spiral_q_v2.fsx" />
     <None Include="optimized_linear_layer_v0.fsx" />
   </ItemGroup>
   <ItemGroup>

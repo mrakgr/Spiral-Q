@@ -51,4 +51,16 @@ I also figured out how to do the wavefront iteration in an elegant fashion witho
 
 Edit: Done with testing. Found and fixed a bug in the `matmult'` function. Just like previously I haven't had any luck with extracting more from the unoptimized LSTM with this. It does bring out the full potential in the `linear_layer_test_v1.fsx` which is a synthetic benchmark. It terms of automating concurrency, I can't do much more than this for the library. I learned quite a bit about Cuda concurrency from this.
 
-Next step - optimized linear layer.
+Next step - the optimized linear layer.
+
+Edit2: The performance of the concurrent linear layer is so poor compared to the original that it is not worth the effort putting into the library.
+
+Maybe if I had the batched gemm with atomic addition to the outputs it would make sense, but not like this. After testing, I've concluded that whether there is a benefit to concurrency depends on whether it is possible to saturate the GPU. And the reason the Reber RNN example does so poorly with extra concurrency is that it is simply too small. I need to expand in depth and width to get the full benefit from it.
+
+An interesting idea that is a small step beyond what I just did in this library would be to sort each forward step by depth.
+
+This would have all the benefits of the wavefront iteration, but for any arbitrary architecture. It is quite amazing now that I think about it. It would definitely be worth adding at some point. It would not be possible to do without what I did just now, but now that I come this far, the step is fairly obvious.
+
+At any rate, right now I am tired from working on the library for so long. I want to get back into reinforcement learning.
+
+Let me wrap this up by doing the LSTM with the union type.
