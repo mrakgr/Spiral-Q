@@ -44,3 +44,7 @@ If I had to make a wish in cuDNN I would like if they could make optimized linea
 Hopefully this will be the last rewrite. I think I have a full idea of how to do automatic concurrency efficiently now, though this is hardly the end of optimization. The trouble with concurrent (and parallel) programming is that for a given problem, changing the inputs changes the structure of the problem. An AI working at 1000x speed of meat brain would have a strong advantage in getting the most juice out of available hardware. It is annoying to be the biggest bottleneck in programming.
 
 With any luck, when I scale up the RNNs in depth and multiple dimensions, the benefits of what I am doing now will become clear. Out of all the optimizations, [the wavefront iteration](https://devblogs.nvidia.com/parallelforall/optimizing-recurrent-neural-networks-cudnn-5/) from the linked post might be the easiest one to do. A simple and general, if relatively inneficient way of doing it would be to store all the (i,j) tuples in an array and sort them by Manhattan distance from (0,0).
+
+UPDATE 4/25/2016: Done with the third rewrite. Time for testing.
+
+I also figured out how to do the wavefront iteration in an elegant fashion without the need for sorting for an arbitrary number of dimensions. It might not be necessarily more efficient though when all is said and done. It is in the `wavefront_iteration_example.fsx`.

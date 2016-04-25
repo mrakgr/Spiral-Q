@@ -278,39 +278,42 @@ type StreamPool(num) =
 // Optimized Linear layers require one or more stream and will throw an exception if not enough of them are allocated.
 let StreamPool = new StreamPool(stream_num) 
 
-let nullary_backward_stream_caller (x : d4MUnion) (f : CudaStream -> unit) =
+let nullary_stream_caller (x : d4MUnion) (f : CudaStream -> CudaEvent -> d4MUnion -> unit) =
     match x.stream_state with
     | Static ->
-        let s,e,_ as sem = StreamPool.P
+        let s,e,m as sem = StreamPool.P
         x.stream_state <- Unpassed sem
-        f s
+        f s e m
         e.Record s.Stream
-    | Unpassed(s,e,_) | Passed(s,e,_) ->
-        f s
+    | Unpassed(s,e,m) ->
+        f s e m
         e.Record s.Stream
-    
+    | Passed(s',e',m') ->
+        let s,e,m as sem = StreamPool.P
+        s.WaitEvent e'.Event
+        x.stream_state <- Unpassed sem
+        f s e m
+        e.Record s.Stream
+
 type d4MUnion with
     /// Sets the adjoint to zero.
     member inline t.setZeroAdjoint() = 
         match t.A with
         | Some A -> 
-            let s,e,_ = StreamPool.P
-            nullary_backward_stream_caller t
-            <| fun s -> A.MemsetAsync(0u,s.Stream)
+            nullary_stream_caller t
+            <| fun s e m -> A.MemsetAsync(0u,s.Stream)
         | None -> ()
 
     /// Sets the primal to zero.
     member inline t.setZeroPrimal() = 
-        let s,e,_ = StreamPool.P
-        nullary_backward_stream_caller t
-        <| fun s -> t.P.MemsetAsync(0u,s.Stream)
+        nullary_stream_caller t
+        <| fun s e m -> t.P.MemsetAsync(0u,s.Stream)
 
     /// Set the matrix to a value.
     member inline t.setPrimal (x: float32) = 
         let v = BitConverter.ToUInt32(BitConverter.GetBytes(x),0)
-        let s,e,_ = StreamPool.P
-        nullary_backward_stream_caller t
-        <| fun s -> t.P.MemsetAsync(v,s.Stream)
+        nullary_stream_caller t
+        <| fun s e m -> t.P.MemsetAsync(v,s.Stream)
 
 let gather_pointer (nchw, p) =
     let size = size_nchw nchw
@@ -1052,7 +1055,36 @@ let inline deadness_check (c : d4MUnion) (a : d4MUnion) (f : unit -> unit) =
         a.is_dead <- Alive
         f()
 
-let binary_forward_stream_matcher (a : d4MUnion) (b : d4MUnion) (c : d4MUnion) = 
+let unary_forward_stream_caller (a : d4MUnion) (c : d4MUnion) (f : CudaStream -> CudaEvent -> d4MUnion -> unit) = 
+    match c.stream_state with
+    | Passed _ -> failwith "This function should never be called on a Passed node in the output. The forward pass is out of order."
+    | Static ->
+        match a.stream_state with
+        | Static -> 
+            let s,e,_ as sem = StreamPool.P
+            c.stream_state <- Unpassed sem
+            sem
+        | Unpassed (s,e,m) ->
+            a.stream_state <- Passed(s,e,m)
+            c.stream_state <- Unpassed(s,e,m)
+            s,e,m
+        | Passed (s',e',m') ->
+            let s,e,_ as sem = StreamPool.P
+            s.WaitEvent e'.Event
+            c.stream_state <- Unpassed sem
+            sem
+    | Unpassed(s,e,m) -> 
+        match a.stream_state with
+        | Unpassed(s',e',m') | Passed(s',e',m') ->
+            s.WaitEvent e'.Event
+            s,e,m
+        | Static -> s,e,m
+    |> fun (s,e,m) ->
+        f s e m
+        e.Record s.Stream
+
+
+let binary_forward_stream_caller (a : d4MUnion) (b : d4MUnion) (c : d4MUnion) (f : CudaStream -> CudaEvent -> d4MUnion -> unit) = 
     match c.stream_state with
     | Passed _ -> failwith "This function should never be called on a Passed node in the output. The forward pass is out of order."
     | Static ->
@@ -1104,8 +1136,11 @@ let binary_forward_stream_matcher (a : d4MUnion) (b : d4MUnion) (c : d4MUnion) =
         match_function a.stream_state
         match_function b.stream_state
         s,e,m
+    |> fun (s,e,m) ->
+        f s e m
+        e.Record s.Stream
 
-let backward_stream_matcher (c : d4MUnion) (a : d4MUnion) =
+let backward_stream_caller (c : d4MUnion) (a : d4MUnion) (f : CudaStream -> CudaEvent -> d4MUnion -> unit) =
     match c.stream_state, a.stream_state with
     | _, Passed _ -> failwith "This function should not be called on a Passed node. Backwards pass is out of order."
     | Static, Static ->
@@ -1123,13 +1158,12 @@ let backward_stream_matcher (c : d4MUnion) (a : d4MUnion) =
         sem
     | Static, Unpassed(s,e,m) ->
         s,e,m
-    | Unpassed(s',e',m'), Unpassed(s,e,m) ->
-        a.stream_state <- Passed(s',e',m')
+    | (Passed(s',e',m') | Unpassed(s',e',m')), Unpassed(s,e,m) ->
         s.WaitEvent e'.Event
         s,e,m
-    | Passed(s',e',m'), Unpassed(s,e,m) ->
-        s.WaitEvent e'.Event
-        s,e,m
+    |> fun (s,e,m) ->
+        f s e m
+        e.Record s.Stream
 
 /// Matrix-matrix multiply.
 let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4MUnion) =
@@ -1140,17 +1174,13 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
             let _,num_cols = b.rc
             ObjectPool.getd4M (false, (num_cols,num_rows,1,1))
             |> fun c ->
-                let s,e,_ = binary_forward_stream_matcher a b c
-
-                gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
-                e.Record s.Stream
+                binary_forward_stream_caller a b c
+                <| fun s e m -> gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
 
                 c
         | Some c ->
-            let s,e,_ = binary_forward_stream_matcher a b c
-
-            gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
-            e.Record s.Stream
+            binary_forward_stream_caller a b c
+            <| fun s e m -> gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
 
             c
 
@@ -1158,19 +1188,15 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
         let matmult_backward_left () = 
             deadness_check c a 
             <| fun _ -> 
-                let s,e,_ = backward_stream_matcher c a
-
-                gemm nT T 1.0f c.A' b.P' 1.0f a.A' s.Stream
-                e.Record s.Stream
+                backward_stream_caller c a
+                <| fun s e m -> gemm nT T 1.0f c.A' b.P' 1.0f a.A' s.Stream
 
         tape.Push(matmult_backward_left)
     if b.A.IsSome then 
         let matmult_backward_right () = 
             deadness_check c b <| fun _ -> 
-                let s,e,_ = backward_stream_matcher c b
-
-                gemm T nT 1.0f a.P' c.A' 1.0f b.A' s.Stream
-                e.Record s.Stream
+                backward_stream_caller c a
+                <| fun s e m -> gemm T nT 1.0f a.P' c.A' 1.0f b.A' s.Stream
 
         tape.Push(matmult_backward_right)
     Some c
@@ -1191,36 +1217,31 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
         then 
             ObjectPool.getd4M (false, left_nchw) 
             |> fun output -> 
-                let s,e,_ = StreamPool.P
+                unary_forward_stream_caller left output
+                <| fun s e m -> geam nT nT 1.0f left.P' 0.0f output.P' output.P' s.Stream
 
-                unary_forward_stream_caller s e left output
-                <| fun _ -> geam nT nT 1.0f left.P' 0.0f output.P' output.P' s.Stream
                 output
         else 
             left
 
     if left_nchw <> right_nchw then
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e right output
-        <| fun _ -> 
+        unary_forward_stream_caller right output
+        <| fun s e m ->
             cudnn.SetStream s
             cudnn.AddTensor(beta,rightDesc,right.P,alpha,leftDesc,output.P) // Add right to output.
     else 
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e right output
-        <| fun _ -> geam nT nT beta right.P' alpha output.P' output.P' s.Stream
+        unary_forward_stream_caller right output
+        <| fun s e m -> geam nT nT beta right.P' alpha output.P' output.P' s.Stream
 
     if right.A.IsSome then 
         let tensor_add_right_backwards () =
             deadness_check output right
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                if left_nchw = right_nchw then
-                    backward_stream_caller s e output right
-                    <| fun _ -> saxpy beta output.A' right.A' s.Stream
-                else
-                    backward_stream_caller s e output right
-                    <| fun _ -> 
+                backward_stream_caller output right
+                <| fun s e m -> 
+                    if left_nchw = right_nchw then
+                        saxpy beta output.A' right.A' s.Stream
+                    else
                         cudnn.SetStream s
                         cudnn.ConvolutionBackwardBias(beta,leftDesc,output.A.Value,1.0f,rightDesc,right.A.Value)
         tape.Push(tensor_add_right_backwards)
@@ -1229,9 +1250,8 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
         let tensor_add_left_backwards () = 
             deadness_check output left 
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e output left
-                <| fun _ -> saxpy alpha output.A' left.A' s.Stream
+                backward_stream_caller output left
+                <| fun s e m -> saxpy alpha output.A' left.A' s.Stream
         tape.Push(tensor_add_left_backwards)
     output
 
@@ -1253,42 +1273,21 @@ let activation_forward mode (input : d4MUnion)  =
 
     let output = ObjectPool.getd4M (false, input_sizes)
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e input output
-        <| fun _ -> 
-            cudnn.SetStream s
-            cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
+    unary_forward_stream_caller input output
+    <| fun s e m -> 
+        cudnn.SetStream s
+        cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
 
     if input.A.IsSome then 
         let activation_backward () =
             deadness_check output input 
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e output input
-                <| fun _ -> 
+                backward_stream_caller output input
+                <| fun s e m -> 
                     cudnn.SetStream s
                     cudnn.ActivationBackward(mode,1.0f,srcTensorDesc,output.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.P,1.0f,srcTensorDesc,input.A.Value)
         tape.Push(activation_backward)
     output
-
-/// The activation function. Zeroes out the target primal during the call.
-/// Stream,event,memory tuple is passed in as the first argument.
-let activation_forward_s mode (s,e : CudaEvent,_ as sem, input : d4MUnion)  =
-    let input_sizes = input.nchw
-    let srcTensorDesc = ObjectPool.getTensorDescriptor input_sizes
-
-    let output = ObjectPool.getd4M (false, input_sizes)
-
-    let _ =
-        cudnn.SetStream s
-        cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
-
-        e.Record s.Stream
-        output.occupancy.Add e
-
-    sem, output
-
 
 /// The pooling function. Zeroes out the target primal during the call.
 let pooling_forward p (input : d4MUnion) =
@@ -1301,20 +1300,17 @@ let pooling_forward p (input : d4MUnion) =
 
     let dstTensorDesc = ObjectPool.getTensorDescriptor dest_sizes
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e input output
-        <| fun _ -> 
-            cudnn.SetStream s
-            cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,input.P,0.0f,dstTensorDesc,output.P)
+    unary_forward_stream_caller input output
+    <| fun s e m -> 
+        cudnn.SetStream s
+        cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,input.P,0.0f,dstTensorDesc,output.P)
 
     if input.A.IsSome then 
         let pooling_backward () =
             deadness_check output input 
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e output input
-                <| fun _ -> 
+                backward_stream_caller output input
+                <| fun s e m -> 
                     cudnn.SetStream s
                     cudnn.PoolingBackward(poolingDescriptor,1.0f,srcTensorDesc,output.P,srcTensorDesc,
                                       output.A.Value,dstTensorDesc,input.P,1.0f,dstTensorDesc,input.A.Value)
@@ -1341,9 +1337,8 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
             dims, ObjectPool.getd4M (false, dims)
 
     let dstTensorDesc = ObjectPool.getTensorDescriptor dims
-
-    let _ =
-        let s,e,workspace = StreamPool.P
+    binary_forward_stream_caller data filter output
+    <| fun s e workspace -> 
         let algo = 
             if use_fast_conv_algos then
                 cudnn.GetConvolutionForwardAlgorithm(srcTensorDesc,filterDesc,convDesc,dstTensorDesc,cudnnConvolutionFwdPreference.PreferFastest,SizeT 0)
@@ -1358,27 +1353,26 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
             | None -> 0.0f
             | Some _ -> 1.0f
 
-        binary_forward_stream_caller s e data filter output
-        <| fun _ -> 
-            use workspace = workspace.P.DevicePointer |> fun p -> new CudaDeviceVariable<byte>(p,false)
-            cudnn.SetStream s
-            cudnn.ConvolutionForward(1.0f,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,beta,dstTensorDesc,output.P) // Don't zero out the previous output.
+
+        use workspace = workspace.P.DevicePointer |> fun p -> new CudaDeviceVariable<byte>(p,false)
+        cudnn.SetStream s
+        cudnn.ConvolutionForward(1.0f,srcTensorDesc,data.P,filterDesc,filter.P,convDesc,algo,workspace,beta,dstTensorDesc,output.P) // Don't zero out the previous output.
 
     if filter.A.IsSome then 
         let convolution_backwards_filter () =
-            let s,e,workspace = StreamPool.P
-            let algo = 
-                if use_fast_conv_algos then
-                    cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.PreferFastest,SizeT 0)
-                else
-                    cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.SpecifyWorkspaceLimit,SizeT 30000)
-            let _ =
-                cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) |> int
-                |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
             deadness_check output filter 
             <| fun _ ->
-                backward_stream_caller s e output filter
-                <| fun _ -> 
+                backward_stream_caller output filter
+                <| fun s e workspace -> 
+                    let algo = 
+                        if use_fast_conv_algos then
+                            cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.PreferFastest,SizeT 0)
+                        else
+                            cudnn.GetConvolutionBackwardFilterAlgorithm(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,cudnnConvolutionBwdFilterPreference.SpecifyWorkspaceLimit,SizeT 30000)
+
+                    cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) 
+                    |> int |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
+
                     use workspace = workspace.P.DevicePointer |> fun p -> new CudaDeviceVariable<byte>(p,false)
                     cudnn.SetStream s
                     cudnn.ConvolutionBackwardFilter(1.0f,srcTensorDesc,data.P,dstTensorDesc,output.A.Value,convDesc,algo,workspace,1.0f,filterDesc,filter.A.Value)
@@ -1386,20 +1380,18 @@ let inline private convolutional_forward' (prev_output: ((int*int*int*int)*d4MUn
 
     if data.A.IsSome then 
         let convolution_backwards_data () =
-            let s,e,workspace = StreamPool.P
-            let algo = 
-                if use_fast_conv_algos then
-                    cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.PreferFastest,SizeT 0)
-                else
-                    cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.SpecifyWorkspaceLimit,SizeT 30000)
-            let _ =
-                cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) |> int
-                |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
-
             deadness_check output data 
             <| fun _ ->
-                backward_stream_caller s e output data
-                <| fun _ -> 
+                backward_stream_caller output data
+                <| fun s e workspace -> 
+                    let algo = 
+                        if use_fast_conv_algos then
+                            cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.PreferFastest,SizeT 0)
+                        else
+                            cudnn.GetConvolutionBackwardDataAlgorithm(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,cudnnConvolutionBwdDataPreference.SpecifyWorkspaceLimit,SizeT 30000)
+                    cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) |> int
+                    |> fun size -> workspace.ReplaceIf((divup size sizeof<float32>,1,1,1))
+
                     use workspace = workspace.P.DevicePointer |> fun p -> new CudaDeviceVariable<byte>(p,false)
                     cudnn.SetStream s
                     cudnn.ConvolutionBackwardData(1.0f,filterDesc,filter.P,dstTensorDesc,output.A.Value,convDesc,1.0f,algo,workspace,srcTensorDesc,data.A.Value)
@@ -1437,9 +1429,8 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
 
     if do_inference = false then
         let _ =
-            let s,e,_ = StreamPool.P
-            unary_forward_stream_caller s e input output
-            <| fun _ -> 
+            unary_forward_stream_caller input output
+            <| fun s e m -> 
                 cudnn.SetStream s
                 cudnn.BatchNormalizationForwardTraining(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,exponentialAverageFactor,bnRunningMean.P,bnRunningVariance.P,epsilon,bnSavedMean.P,bnSavedVariance.P)
         if input.A.IsSome then 
@@ -1449,17 +1440,14 @@ let batch_normalization_forward bnMode (bnScale : d4MUnion) (bnBias : d4MUnion) 
 
                 deadness_check output input 
                 <| fun _ ->
-                    let s,e,_ = StreamPool.P
-                    backward_stream_caller s e output input
-                    <| fun _ -> 
+                    backward_stream_caller output input
+                    <| fun s e m -> 
                         cudnn.SetStream s
                         cudnn.BatchNormalizationBackward(bnMode,dx_alpha,dx_beta,param_alpha,param_beta,srcTensorDesc,input.P,srcTensorDesc,output.A.Value,srcTensorDesc,input.A.Value,bnDesc,bnScale.P,bnScale.A.Value,bnBias.A.Value,epsilon,bnSavedMean.P,bnSavedVariance.P)
             tape.Push batch_normalization_backward
     else
-        let s,e,_ = StreamPool.P
-        
-        unary_forward_stream_caller s e input output
-        <| fun _ -> 
+        unary_forward_stream_caller input output
+        <| fun s e m -> 
             cudnn.SetStream s
             cudnn.BatchNormalizationForwardInference(bnMode,alpha,beta,srcTensorDesc,input.P,srcTensorDesc,output.P,bnDesc,bnScale.P,bnBias.P,bnRunningMean.P,bnRunningVariance.P, epsilon)
         
@@ -1481,33 +1469,29 @@ let inline private hadmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
     let c = 
         match prev_output with
         | Some c -> 
-            let s,e,_ = StreamPool.P
-            binary_forward_stream_caller s e a b c
-            <| fun _ -> hadamaradMultiplicationErrorModule.Value.A(a.P', b.P', c.P', c.P', s.Stream)
+            binary_forward_stream_caller a b c
+            <| fun s e m -> hadamaradMultiplicationErrorModule.Value.A(a.P', b.P', c.P', c.P', s.Stream)
             c
         | None -> 
             ObjectPool.getd4M (false, a.nchw)
             |> fun c -> 
-                let s,e,_ = StreamPool.P
-                binary_forward_stream_caller s e a b c
-                <| fun _ -> hadamaradMultiplicationModule.Value.A(a.P', b.P', c.P', s.Stream)
+                binary_forward_stream_caller a b c
+                <| fun s e m -> hadamaradMultiplicationModule.Value.A(a.P', b.P', c.P', s.Stream)
                 c
 
     if a.A.IsSome then 
         let hadmult_backward_left () = 
             deadness_check c a 
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> hadamaradMultiplicationErrorModule.Value.A(b.P', c.A', a.A', a.A', s.Stream)
+                backward_stream_caller c a
+                <| fun s e m -> hadamaradMultiplicationErrorModule.Value.A(b.P', c.A', a.A', a.A', s.Stream)
         tape.Push hadmult_backward_left
     if b.A.IsSome then 
         let hadmult_backward_right () = 
             deadness_check c b 
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c b
-                <| fun _ -> hadamaradMultiplicationErrorModule.Value.A(a.P', c.A', b.A', b.A', s.Stream)
+                backward_stream_caller c b
+                <| fun s e m -> hadamaradMultiplicationErrorModule.Value.A(a.P', c.A', b.A', b.A', s.Stream)
         tape.Push hadmult_backward_right
     Some c
 
@@ -1520,19 +1504,16 @@ let squareModule = lazy new DeviceUnaryTransformModule("x*x;","Square")
 let squareErrorModule = lazy new DeviceTrinaryTransformModule("2.0f*x*y + z;","SquareError")
 let square (a:d4MUnion) =
     let c = ObjectPool.getd4M (false,a.nchw)
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e a c
-        <| fun _ -> squareModule.Value.A(a.P',c.P',s.Stream)
-        c
+
+    unary_forward_stream_caller a c
+    <| fun s e m -> squareModule.Value.A(a.P',c.P',s.Stream)
 
     if a.A.IsSome then 
         let square_backward () = 
             deadness_check c a 
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> squareErrorModule.Value.A(a.P',c.A',a.A',a.A',s.Stream)
+                backward_stream_caller c a
+                <| fun s e m -> squareErrorModule.Value.A(a.P',c.A',a.A',a.A',s.Stream)
         tape.Push square_backward
     c
 
@@ -1543,20 +1524,16 @@ let sumModule = lazy new DeviceUnaryMapSumModule("x;", "Sum")
 let sumErrorModule = lazy new DeviceUnaryCoefTransformModule("coef_x + x;", "SumError")
 let sum (a:d4MUnion) =
     let c = Df.create 0.0f
-    let _ =
-        let s,e,_ = StreamPool.P
-        wait_on_all_events s a.occupancy
-        c.P := sumModule.Value.A(a.P',s.Stream)
-        //e.Record s.Stream // Not necessary here.
-        
+
+    nullary_stream_caller a
+    <| fun s e m -> c.P := sumModule.Value.A(a.P',s.Stream)
 
     if a.A.IsSome then 
         let sum_backward () = 
             if !c.A <> 0.0f then 
                 a.is_dead <- Alive
-                let s,e,_ = StreamPool.P
-                nullary_backward_stream_caller s e a
-                <| fun _ -> sumErrorModule.Value.A(!c.A,a.A',a.A',s.Stream)
+                nullary_stream_caller a
+                <| fun s e m -> sumErrorModule.Value.A(!c.A,a.A',a.A',s.Stream)
             else a.is_dead <- Dead
         tape.Push sum_backward
     c
@@ -1589,18 +1566,15 @@ let logErrorModule = lazy new DeviceTrinaryTransformModule("y / x + z;","LogErro
 let log_ (a:d4MUnion) =
     let c = ObjectPool.getd4M (false, a.nchw)
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e a c
-        <| fun _ -> logModule.Value.A(a.P',c.P',s.Stream)
+    unary_forward_stream_caller a c
+    <| fun s e m -> logModule.Value.A(a.P',c.P',s.Stream)
 
     if a.A.IsSome then
         let log_backward () = 
             deadness_check c a 
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> logErrorModule.Value.A(a.P',c.A', a.A', a.A', s.Stream)
+                backward_stream_caller c a
+                <| fun s e m -> logErrorModule.Value.A(a.P',c.A', a.A', a.A', s.Stream)
         tape.Push log_backward
     c
 
@@ -1611,18 +1585,15 @@ let scalarMatrixAddModule = lazy new DeviceBinaryCoefTransformModule("coef_x + c
 let scalar_matrix_add scalar coef (a:d4MUnion) =
     let c = ObjectPool.getd4M (false, a.nchw)
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e a c
-        <| fun _ -> scalarMatrixAddModule.Value.A(scalar,a.P',coef,a.P',c.P',s.Stream)
+    unary_forward_stream_caller a c
+    <| fun s e m -> scalarMatrixAddModule.Value.A(scalar,a.P',coef,a.P',c.P',s.Stream)
 
     if a.A.IsSome then
         let scalar_matrix_add_backward () = 
             deadness_check c a
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> saxpy coef c.A' a.A' s.Stream
+                backward_stream_caller c a
+                <| fun s e m -> saxpy coef c.A' a.A' s.Stream
         tape.Push scalar_matrix_add_backward
     c
 
@@ -1630,26 +1601,22 @@ let scalar_matrix_add scalar coef (a:d4MUnion) =
 let add alpha (a: d4MUnion) beta (b: d4MUnion) =
     let c = ObjectPool.getd4M (false, a.nchw)
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        binary_forward_stream_caller s e a b c
-        <| fun _ -> geam nT nT alpha a.P' beta b.P' c.P' s.Stream
+    binary_forward_stream_caller a b c
+    <| fun s e m -> geam nT nT alpha a.P' beta b.P' c.P' s.Stream
 
     if a.A.IsSome then
         let add_backward_left () = 
             deadness_check c a
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> saxpy alpha c.A' a.A' s.Stream
+                backward_stream_caller c a
+                <| fun s e m -> saxpy alpha c.A' a.A' s.Stream
         tape.Push add_backward_left
     if b.A.IsSome then
         let add_backward_right () = 
             deadness_check c b
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c b
-                <| fun _ -> saxpy beta c.A' b.A' s.Stream
+                backward_stream_caller c b
+                <| fun s e m -> saxpy beta c.A' b.A' s.Stream
         tape.Push add_backward_right
     c
 
@@ -1662,15 +1629,17 @@ let softmax_instance_forward (data : d4MUnion) =
     let algo = cudnnSoftmaxAlgorithm.Accurate // Log mode forgets to re-exponentiate at the end.
     let mode = cudnnSoftmaxMode.Instance
 
-    cudnn.SoftmaxForward(algo,mode,1.0f,srcTensorDesc,data.P,0.0f,srcTensorDesc,output.P)
+    unary_forward_stream_caller data output
+    <| fun s e m ->
+        cudnn.SetStream s
+        cudnn.SoftmaxForward(algo,mode,1.0f,srcTensorDesc,data.P,0.0f,srcTensorDesc,output.P)
 
     if data.A.IsSome then
         let softmax_channel_backward () =
             deadness_check output data
             <| fun _ ->
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e output data
-                <| fun _ ->
+                backward_stream_caller output data
+                <| fun s e m ->
                     cudnn.SetStream s
                     cudnn.SoftmaxBackward(algo,mode,1.0f,srcTensorDesc,output.P,srcTensorDesc,output.A.Value,1.0f,srcTensorDesc,data.A.Value)
         tape.Push softmax_channel_backward
@@ -1686,18 +1655,15 @@ let clipErrorModule = lazy new DeviceTrinaryCoefTransformModule("y*((x < coef_x)
 let clip min max (a : d4MUnion) scalar =
     let c = ObjectPool.getd4M (false, a.nchw)
 
-    let _ =
-        let s,e,_ = StreamPool.P
-        unary_forward_stream_caller s e a c
-        <| fun _ -> clipModule.Value.A(min,a.P',max,a.P',scalar,a.P',c.P',s.Stream)
+    unary_forward_stream_caller a c
+    <| fun s e m -> clipModule.Value.A(min,a.P',max,a.P',scalar,a.P',c.P',s.Stream)
 
     if a.A.IsSome then
         let clip_backward () = 
             deadness_check c a
             <| fun _ -> 
-                let s,e,_ = StreamPool.P
-                backward_stream_caller s e c a
-                <| fun _ -> clipErrorModule.Value.A(min,a.P',max,c.A',max,a.A',a.A',s.Stream)
+                backward_stream_caller c a
+                <| fun s e m -> clipErrorModule.Value.A(min,a.P',max,c.A',max,a.A',a.A',s.Stream)
         tape.Push clip_backward
     c
 
@@ -1707,9 +1673,6 @@ let inline relu x =
 let inline sigmoid x = 
     let t = ObjectPool.getActivationDescriptor (cudnnActivationMode.Sigmoid, defaultReluNanOption, 0.0)
     activation_forward t x
-let inline sigmoid_s x = 
-    let t = ObjectPool.getActivationDescriptor (cudnnActivationMode.Sigmoid, defaultReluNanOption, 0.0)
-    activation_forward_s t x
 let inline tanh_ x = 
     let t = ObjectPool.getActivationDescriptor (cudnnActivationMode.Tanh, defaultReluNanOption, 0.0)
     activation_forward t x
@@ -1732,11 +1695,13 @@ let maxColumnActivationModule = lazy new DeviceMaxColumnActivationModule()
 let accuracyModule = lazy new DeviceBinaryMapSumModule("(x*y == 0.0f) ? 0.0f : 1.0f;","Accuracy")
 let get_accuracy (targets : d4MUnion) (activations : d4MUnion) =
     lazy
-        let s,e,o = StreamPool.P
-        o.ReplaceIf(targets.nchw)
-        wait_on_all_events s activations.occupancy
-        maxColumnActivationModule.Value.A(activations.P',o.P',s.Stream)
-        accuracyModule.Value.A(targets.P',o.P',s.Stream).Value
+        let mutable t = 0.0f
+        nullary_stream_caller activations
+        <| fun s e o ->
+            o.ReplaceIf(targets.nchw)
+            maxColumnActivationModule.Value.A(activations.P',o.P',s.Stream)
+            t <- accuracyModule.Value.A(targets.P',o.P',s.Stream).Value
+        t
 
 let find_max_index (action_values : float32[]) =
     let mutable max = Single.NegativeInfinity
@@ -1755,8 +1720,8 @@ type d4MUnion with
 
 let sgd learning_rate (node : d4MUnion) = 
     let s,e,_ = StreamPool.P
-    nullary_backward_stream_caller s e node
-    <| fun _ -> saxpy -learning_rate node.A' node.P' s.Stream
+    nullary_stream_caller node
+    <| fun s e m -> saxpy -learning_rate node.A' node.P' s.Stream
 
 type INNet =
       abstract member ResetAdjoints : unit -> unit
