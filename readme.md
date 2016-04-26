@@ -8,10 +8,10 @@ UPDATE 4/19/2016: Done rewriting the library. Now it will automatically execute 
 I still have not run it even once though, so I am sure I am in for a painful debugging experience. But after that is done, I will be able to write the optimized linear layers and the LSTM implementation. The one that come in new cuDNN v5 is not suitable as it requires prepared inputs, while for my use case, I need to do action selection at every step.
 
 Before I continue, let me do a short list of added features since v1:
--4d tensor type (replaced with the union type in this version)
+-4d tensor type ~~(replaced with the union type in this version)~~
 -Cuda module caching
 -Automatic concurrency
--Union 4d tensor type
+~~-Union 4d tensor type~~
 
 Asynchronous memory copies are currently lacking but they are hardly a priority. I might need them to copy pointers for batched gemm by that is not currently on my agenda. I also added a inference_only_flag variable to prevent the adjoints being zeroed out automatically during the forward pass. For the automatic concurrency to work, the occupancy arrays need to be cleaned out after every pass. The backprop_tape function does this at start of the backward pass and the ResetOccupancy needs to be called at the end of the pass as well. The layer classes still do not clean the occupancy arrays of the base nodes automatically yet.
 
@@ -59,8 +59,24 @@ Maybe if I had the batched gemm with atomic addition to the outputs it would mak
 
 An interesting idea that is a small step beyond what I just did in this library would be to sort each forward step by depth.
 
-This would have all the benefits of the wavefront iteration, but for any arbitrary architecture. It is quite amazing now that I think about it. It would definitely be worth adding at some point. It would not be possible to do without what I did just now, but now that I come this far, the step is fairly obvious.
+This would have the optimal scheduling benefit of the wavefront iteration, but for any arbitrary architecture. It is quite amazing now that I think about it. It would definitely be worth adding at some point. It would not be possible to do without what I did just now, but now that I come this far, the step is fairly obvious. It is strange that the cuDNN post said that the mainstream libraries are not using it.
 
 At any rate, right now I am tired from working on the library for so long. I want to get back into reinforcement learning.
 
 Let me wrap this up by doing the LSTM with the union type.
+
+UPDATE 4/26/2016: I've worked out how to make the union type work, but the cuDNN library currently lacks the CHWN layout so it won't be possible to get it done with convolutional functions for example. To be honest, the entire thing is quite tedious in terms of book-keeping so much that I've considered leaving it out. Before I move on to it, let me go with the sort idea from yesterday. It occurs to me that I've made a serious mistake by not printing out the depths in which the nodes are executed. That would have told me quite a lot about where the bottlenecks lie.
+
+Also if I end up going with GRUs instead of LSTMs I would have just wasted my time doing the union type.
+
+Edit: I've concluded that I simply cannot do the union type. As a feature it is too expensive for me in terms of effort required to support it. And I cannot think of an elegant way to add it to the library. Starting from here I'll look into removing the stump and wrap this up. One last feature I will add is to redirect gemm to gemv if the matrix-matrix is in fact matrix-vector multiplication.
+
+In terms of complexity, probably I am at my limit with Spiral here. There is only so much one person can do without making library maintenance a full time occupation. Past this, I'd be better off writting a .NET F# wrapper for Tensorflow when it comes to Windows, which it eventually will.
+
+Currently, I am trying to find some benefit in the concurrency thing that I did. When scaling the RNN LSTM example so it uses multiple layers, I finally start to observe some benefit. Right now I am in the process of creating a wavefront iteration example.
+
+...I need a break. This has definitely gotten tedious, but I'll keep marching on. Same as usual. Making those RL players was a lot more fun than this. After I am done with this iteration I will definitely look towards outsourcing my ML work to some library. I know the ins and outs of backprop now so I would not feel bad about that anymore.
+
+Edit2: I've tested this to hell. I cannot get the benfits of concurrency for the LSTM class to go much above 30% in any realistic setting. Not really what I expected. I really got carried away by that cuDNN v5 post.
+
+In the end, it depends on the architecture. The sparser and more divergent the architecture, the more benefit I can expect to accrue from concurrency. By sparsity I do not mean a sparse activation or dropout, or anything along that line, but having seperate loosely connected modules. That could be where the benefits of concurrency accrue.

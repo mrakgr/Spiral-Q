@@ -3,6 +3,8 @@
 
 // http://christianherta.de/lehre/dataScience/machineLearning/neuralNetworks/reberGrammar.php
 
+module Embedded_reber
+
 type reberNode =
     | NodeF  // Only outputs B.
     | NodeS  // Can only receive B. Outputs T or P.

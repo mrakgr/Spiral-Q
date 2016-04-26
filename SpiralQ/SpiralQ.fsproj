@@ -61,17 +61,24 @@
     <None Include="spiral_q_v1.fsx" />
     <None Include="mnist_example_v4.fsx" />
     <None Include="batch_normalization_example.fsx" />
-    <None Include="embedded_reber.fsx" />
     <None Include="rnn_example_v0.fsx" />
     <Content Include="packages.config" />
     <None Include="linear_layer_test_v0.fsx" />
     <None Include="wavefront_iteration_example.fsx" />
     <None Include="linear_layer_test_v1.fsx" />
-    <None Include="rnn_example_v1.fsx" />
     <None Include="test_v3.fsx" />
     <None Include="mnist_example_v5.fsx" />
-    <None Include="spiral_q_v2.fsx" />
     <None Include="optimized_linear_layer_v0.fsx" />
+    <None Include="spiral_q_v3_depth.fsx" />
+    <None Include="rnn_example_v2.fsx" />
+    <None Include="spiral_q_v3.fsx" />
+    <None Include="lstm_union.fsx" />
+    <Compile Include="spiral_q_v2.fs" />
+    <None Include="embedded_reber.fsx" />
+    <None Include="rnn_example_v1.fsx" />
+    <None Include="rnn_example_v1b.fsx" />
+    <None Include="rnn_example_v1_wavefront.fsx" />
+    <Compile Include="rnn_last_test.fs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">

@@ -1,7 +1,7 @@
 ﻿// Basic reverse mode AD on the GPU. This v3 of Spiral is focused on the union type and automatic parallelization. Uses the cuDNN v5 RC.
 // It has come a long way since v1.
 
-// Hopefully this will be the last rewrite.
+// This one is incomplete. It just prints out depth for the LSTM example.
 
 module SpiralV3
 
@@ -118,6 +118,7 @@ and d4MUnion =
     mutable A: CudaDeviceVariable<float32> option // adjoint
     mutable is_dead : DeadFlagType // flag to skip backprop
     mutable stream_state : StreamStateType
+    mutable depth : int
     }  
 
     static member ar_scan (ar : (int * int * int * int)[]) = ar |> Array.scan (fun state e -> state + sizeof<float32> * size_nchw e) 0
@@ -145,7 +146,7 @@ and d4MUnion =
         let elements_size, elements_primal, elements_adjoint = d4MUnion.make_elements p a ar l
 
         {elements_size = elements_size; elements_primal=elements_primal; elements_adjoint=elements_adjoint; 
-        P=p; A=a; is_dead=Undefined; stream_state = Static}
+        P=p; A=a; is_dead=Undefined; stream_state = Static; depth = 0}
 
     static member create' (ar_data : ((int * int * int * int) * float32[]) [], is_constant) =
         let ar, data = Array.unzip ar_data
@@ -1180,14 +1181,16 @@ let inline private matmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
             let _,num_cols = b.rc
             ObjectPool.getd4M (false, (num_cols,num_rows,1,1))
             |> fun c ->
+                c.depth <- (max a.depth b.depth)+1
+                printfn "%i (in matmult)" c.depth
                 binary_forward_stream_caller a b c
                 <| fun s e m -> gemm nT nT 1.0f a.P' b.P' 0.0f c.P' s.Stream
-
                 c
         | Some c ->
+            c.depth <- (max a.depth b.depth)+1 |> fun x -> max x c.depth
+            printfn "%i (in matmult)" c.depth
             binary_forward_stream_caller a b c
             <| fun s e m -> gemm nT nT 1.0f a.P' b.P' 1.0f c.P' s.Stream
-
             c
 
     if a.A.IsSome then 
@@ -1223,12 +1226,16 @@ let inline tensor_add' add_to_left alpha (left : d4MUnion) beta (right : d4MUnio
         then 
             ObjectPool.getd4M (false, left_nchw) 
             |> fun output -> 
+                output.depth <- (max left.depth right.depth)+1
                 unary_forward_stream_caller left output
                 <| fun s e m -> geam nT nT 1.0f left.P' 0.0f output.P' output.P' s.Stream
 
                 output
         else 
+            left.depth <- (max left.depth right.depth)
             left
+
+    printfn "%i (in tensor_add)" output.depth
 
     if left_nchw <> right_nchw then
         unary_forward_stream_caller right output
@@ -1283,6 +1290,9 @@ let activation_forward mode (input : d4MUnion)  =
     <| fun s e m -> 
         cudnn.SetStream s
         cudnn.ActivationForward(mode,1.0f,srcTensorDesc,input.P,0.0f,srcTensorDesc,output.P)
+
+    output.depth <- input.depth+1
+    printfn "%i (in activation_forward)" output.depth
 
     if input.A.IsSome then 
         let activation_backward () =
@@ -1475,12 +1485,16 @@ let inline private hadmult' (prev_output : d4MUnion option) ((a,b): d4MUnion*d4M
     let c = 
         match prev_output with
         | Some c -> 
+            c.depth <- (max a.depth b.depth)+1 |> fun x -> max x c.depth
+            printfn "%i (in hadmult)" c.depth
             binary_forward_stream_caller a b c
             <| fun s e m -> hadamaradMultiplicationErrorModule.Value.A(a.P', b.P', c.P', c.P', s.Stream)
             c
         | None -> 
             ObjectPool.getd4M (false, a.nchw)
             |> fun c -> 
+                c.depth <- (max a.depth b.depth)+1 |> fun x -> max x c.depth
+                printfn "%i (in hadmult)" c.depth
                 binary_forward_stream_caller a b c
                 <| fun s e m -> hadamaradMultiplicationModule.Value.A(a.P', b.P', c.P', s.Stream)
                 c
@@ -1510,6 +1524,9 @@ let squareModule = lazy new DeviceUnaryTransformModule("x*x;","Square")
 let squareErrorModule = lazy new DeviceTrinaryTransformModule("2.0f*x*y + z;","SquareError")
 let square (a:d4MUnion) =
     let c = ObjectPool.getd4M (false,a.nchw)
+
+    c.depth <- a.depth+1
+    printfn "%i (in square)" c.depth
 
     unary_forward_stream_caller a c
     <| fun s e m -> squareModule.Value.A(a.P',c.P',s.Stream)
@@ -1607,6 +1624,9 @@ let scalar_matrix_add scalar coef (a:d4MUnion) =
 let add alpha (a: d4MUnion) beta (b: d4MUnion) =
     let c = ObjectPool.getd4M (false, a.nchw)
 
+    c.depth <- (max a.depth b.depth)+1 |> fun x -> max x c.depth
+    printfn "%i (in add) a=%i b=%i" c.depth a.depth b.depth
+    
     binary_forward_stream_caller a b c
     <| fun s e m -> geam nT nT alpha a.P' beta b.P' c.P' s.Stream
 
@@ -1660,6 +1680,9 @@ let clipErrorModule = lazy new DeviceTrinaryCoefTransformModule("y*((x < coef_x)
 /// Can be used to make linear clipped sigmoid by setting min,max,scalar to -0.5f,0.5f,0.5f.
 let clip min max (a : d4MUnion) scalar =
     let c = ObjectPool.getd4M (false, a.nchw)
+
+    c.depth <- a.depth+1
+    printfn "%i (in square)" c.depth
 
     unary_forward_stream_caller a c
     <| fun s e m -> clipModule.Value.A(min,a.P',max,a.P',scalar,a.P',c.P',s.Stream)
@@ -1794,7 +1817,8 @@ type FeedforwardLayer =
 
     interface INNet with
         member l.runLayer (x:d4MUnion) =
-            linear_layer_matmult [|l.W,x|] (Some l.b) |> l.a
+            linear_layer_matmult [|x,l.W|] None//(Some l.b) 
+            |> l.a
 
         /// This second attribute is supposed to be the exponential factor from the BN layer, but it is not used here.
         member l.train (x: d4MUnion) _ = (l :> INNet).runLayer x
@@ -2098,6 +2122,8 @@ type LSTMLayer =
         let forget_gate = linear_layer_matmult [|l.W_f,x;l.U_f,y;l.P_f,c|] (Some l.b_f) |> sigmoid
         let c' = linear_layer_hadmult [|block_input,input_gate;c,forget_gate|]
         let output_gate = linear_layer_matmult [|l.W_o,x;l.U_o,y;l.P_o,c'|] (Some l.b_o) |> sigmoid
+        printfn "output_gate = %i" output_gate.depth
+        printfn "c' = %i" c'.depth
         hadmult (l.block_output_a c') output_gate, c'
 
     member l.runLayerNoH (x:d4MUnion) =
