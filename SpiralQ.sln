@@ -11,6 +11,43 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 		TODO.txt = TODO.txt
 	EndProjectSection
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tests", "Tests", "{0C0BFADD-3B6A-4068-BA2C-D411E6E32D8D}"
+	ProjectSection(SolutionItems) = preProject
+		SpiralQ\Tests\batch_normalization_example.fsx = SpiralQ\Tests\batch_normalization_example.fsx
+		SpiralQ\Tests\callback_example.fsx = SpiralQ\Tests\callback_example.fsx
+		SpiralQ\Tests\embedded_reber.fsx = SpiralQ\Tests\embedded_reber.fsx
+		SpiralQ\Tests\event_example.fsx = SpiralQ\Tests\event_example.fsx
+		SpiralQ\Tests\linear_layer_test_v0.fsx = SpiralQ\Tests\linear_layer_test_v0.fsx
+		SpiralQ\Tests\linear_layer_test_v1.fsx = SpiralQ\Tests\linear_layer_test_v1.fsx
+		SpiralQ\Tests\lstm_partial_test.fsx = SpiralQ\Tests\lstm_partial_test.fsx
+		SpiralQ\Tests\lstm_union.fsx = SpiralQ\Tests\lstm_union.fsx
+		SpiralQ\Tests\matrix_mult_test.fsx = SpiralQ\Tests\matrix_mult_test.fsx
+		SpiralQ\Tests\mnist_example_v2.fsx = SpiralQ\Tests\mnist_example_v2.fsx
+		SpiralQ\Tests\mnist_example_v4.fsx = SpiralQ\Tests\mnist_example_v4.fsx
+		SpiralQ\Tests\mnist_example_v5.fsx = SpiralQ\Tests\mnist_example_v5.fsx
+		SpiralQ\Tests\optimized_linear_layer_v0.fsx = SpiralQ\Tests\optimized_linear_layer_v0.fsx
+		SpiralQ\Tests\rnn_example_v0.fsx = SpiralQ\Tests\rnn_example_v0.fsx
+		SpiralQ\Tests\rnn_example_v1.fsx = SpiralQ\Tests\rnn_example_v1.fsx
+		SpiralQ\Tests\rnn_example_v1_wavefront.fsx = SpiralQ\Tests\rnn_example_v1_wavefront.fsx
+		SpiralQ\Tests\rnn_example_v1b.fsx = SpiralQ\Tests\rnn_example_v1b.fsx
+		SpiralQ\Tests\rnn_example_v2.fsx = SpiralQ\Tests\rnn_example_v2.fsx
+		SpiralQ\Tests\Script1.fsx = SpiralQ\Tests\Script1.fsx
+		SpiralQ\Tests\spiral_q_v0.fsx = SpiralQ\Tests\spiral_q_v0.fsx
+		SpiralQ\Tests\spiral_q_v1.fsx = SpiralQ\Tests\spiral_q_v1.fsx
+		SpiralQ\Tests\spiral_q_v2.fsx = SpiralQ\Tests\spiral_q_v2.fsx
+		SpiralQ\Tests\spiral_q_v3.fsx = SpiralQ\Tests\spiral_q_v3.fsx
+		SpiralQ\Tests\spiral_q_v3_depth.fsx = SpiralQ\Tests\spiral_q_v3_depth.fsx
+		SpiralQ\Tests\t10k-images.idx3-ubyte = SpiralQ\Tests\t10k-images.idx3-ubyte
+		SpiralQ\Tests\t10k-labels.idx1-ubyte = SpiralQ\Tests\t10k-labels.idx1-ubyte
+		SpiralQ\Tests\test_v0'.fsx = SpiralQ\Tests\test_v0'.fsx
+		SpiralQ\Tests\test_v0.fsx = SpiralQ\Tests\test_v0.fsx
+		SpiralQ\Tests\test_v1.fsx = SpiralQ\Tests\test_v1.fsx
+		SpiralQ\Tests\test_v3.fsx = SpiralQ\Tests\test_v3.fsx
+		SpiralQ\Tests\train-images.idx3-ubyte = SpiralQ\Tests\train-images.idx3-ubyte
+		SpiralQ\Tests\train-labels.idx1-ubyte = SpiralQ\Tests\train-labels.idx1-ubyte
+		SpiralQ\Tests\wavefront_iteration_example.fsx = SpiralQ\Tests\wavefront_iteration_example.fsx
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
