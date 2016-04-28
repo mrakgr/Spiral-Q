@@ -108,3 +108,17 @@ For comparison, just ten years ago, training a fully connected net with not even
 Today with stochastic depth, batch normalization and residual learning, training a thousand layer net without any pretraining is possible without the gradients disappearing or exploding.
 
 2026? I'll leave that as an open question. But rather than to just ponder, the best would be to reach out for the answer oneself.
+
+UPDATE 4/28/2016: Finally did a comparison of Spiral with another library - in this case Tensorflow. I've converted the two Reber examples - one single LSTM layer net and one 5 LSTM layer net to Python - and compared the speeds. For the tests, I've turned off the biases as there is a cripling bug in cuDNN add tensor function currently that makes adding biases take longer than matrix multiplication. The Python examples are currently in the Tests directory.
+
+The result is that for the one layer example, TF is 10% faster (2.8 vs 3.1) and on the five layer example Spiral is faster (14.9 vs 13.1) due to using 32 streams. Without that latest feature it would be 18.1s.
+
+So basically, my simple AD library is within shooting distance of Google's favorite toy, probably because of the object pool.
+
+To be honest, I expected more from TF, but in the latest iteration (0.8) it is not as slow as it used to be. I know for a fact that it is now using the object pool as well unlike in 0.5.
+
+Yesterday I was pretty depressed about reaching my limit with Spiral, but now I feel a lot better about it.
+
+If I could do the whole LSTM cell in an optimizing compiler like [Futhark](http://futhark-lang.org//) and extract that code, then it is likely that I could achieve significant efficiency gains. However, Futhark is young and contributing to it won't be my next project by any means, but a longer term thing. I can see the next form of Spiral from here, but I have no choice but to wait until the pieces come into place for me to transform it.
+
+Currently, not many in the ML community see the lack of a great high level GPU functional language as a primary bottleneck to performance, but I hope that view propagates into the collective consciousness eventually.

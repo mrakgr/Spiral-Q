@@ -10,7 +10,7 @@ open System.IO
 
 #if INTERACTIVE
 #load "spiral_q_v2.fsx"
-#r "../packages/FSharp.Charting.0.90.14/lib/net40/FSharp.Charting.dll"
+#r "../../packages/FSharp.Charting.0.90.14/lib/net40/FSharp.Charting.dll"
 #r "System.Windows.Forms.DataVisualization.dll"
 #load "embedded_reber.fsx"
 #endif
@@ -127,6 +127,35 @@ let lstm_embedded_reber_train num_iters learning_rate (data: d4MUnion[]) (target
 
 let d_training_data_20, d_target_data_20 = make_data_from_set 20
 let d_training_data_validation, d_target_data_validation = make_data_from_set 30
+
+//d_training_data_20 
+//|> Array.iteri (fun i x -> 
+//    x.P.Gather() 
+//    |> fun x -> 
+//        use f = new BinaryWriter(File.OpenWrite(Path.Combine(__SOURCE_DIRECTORY__,"d_training_data_20_7_314_" + string i + ".dat")))
+//        x |> Array.iter (fun x -> f.Write(x)))
+//
+//d_target_data_20 
+//|> Array.iteri (fun i x -> 
+//    x.P.Gather() 
+//    |> fun x -> 
+//        use f = new BinaryWriter(File.OpenWrite(Path.Combine(__SOURCE_DIRECTORY__,"d_target_data_20_7_314_" + string i + ".dat")))
+//        x |> Array.iter (fun x -> f.Write(x)))
+//
+//d_training_data_validation 
+//|> Array.iteri (fun i x -> 
+//    x.P.Gather() 
+//    |> fun x -> 
+//        use f = new BinaryWriter(File.OpenWrite(Path.Combine(__SOURCE_DIRECTORY__,"d_training_data_validation_7_35_" + string i + ".dat")))
+//        x |> Array.iter (fun x -> f.Write(x)))
+//
+//d_target_data_validation 
+//|> Array.iteri (fun i x -> 
+//    x.P.Gather() 
+//    |> fun x -> 
+//        use f = new BinaryWriter(File.OpenWrite(Path.Combine(__SOURCE_DIRECTORY__,"d_target_data_validation_7_35_" + string i + ".dat")))
+//        x |> Array.iter (fun x -> f.Write(x)))
+
 
 let hidden_size = 128
 
