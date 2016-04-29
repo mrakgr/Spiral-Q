@@ -1,6 +1,8 @@
-# Spiral V3
+# Spiral V3 - Basic AD on the GPU
 
-The third version of the library with the union type and automatic concurrency. Hopefully this will be sufficient for me to use Deep Q Learning.
+The third version of the library with the union type and automatic concurrency. Hopefully this will be sufficient for me to use Deep Q Learning. 
+
+Currently, I am waiting for the cuDNN v5 wrapper that I wrote to be merged into the Managed Cuda library.
 
 UPDATE 4/18/2016: Halfway done with rewriting the library in terms of LOC.
 UPDATE 4/19/2016: Done rewriting the library. Now it will automatically execute concurrent kernels.
@@ -8,9 +10,13 @@ UPDATE 4/19/2016: Done rewriting the library. Now it will automatically execute 
 I still have not run it even once though, so I am sure I am in for a painful debugging experience. But after that is done, I will be able to write the optimized linear layers and the LSTM implementation. The one that come in new cuDNN v5 is not suitable as it requires prepared inputs, while for my use case, I need to do action selection at every step.
 
 Before I continue, let me do a short list of added features since v1:
+
 -4d tensor type ~~(replaced with the union type in this version)~~
+
 -Cuda module caching
+
 -Automatic concurrency
+
 ~~-Union 4d tensor type~~
 
 Asynchronous memory copies are currently lacking but they are hardly a priority. I might need them to copy pointers for batched gemm by that is not currently on my agenda. I also added a inference_only_flag variable to prevent the adjoints being zeroed out automatically during the forward pass. For the automatic concurrency to work, the occupancy arrays need to be cleaned out after every pass. The backprop_tape function does this at start of the backward pass and the ResetOccupancy needs to be called at the end of the pass as well. The layer classes still do not clean the occupancy arrays of the base nodes automatically yet.
