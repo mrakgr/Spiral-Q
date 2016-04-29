@@ -122,3 +122,7 @@ Yesterday I was pretty depressed about reaching my limit with Spiral, but now I 
 If I could do the whole LSTM cell in an optimizing compiler like [Futhark](http://futhark-lang.org//) and extract that code, then it is likely that I could achieve significant efficiency gains. However, Futhark is young and contributing to it won't be my next project by any means, but a longer term thing. I can see the next form of Spiral from here, but I have no choice but to wait until the pieces come into place for me to transform it.
 
 Currently, not many in the ML community see the lack of a great high level GPU functional language as a primary bottleneck to performance, but I hope that view propagates into the collective consciousness eventually.
+
+Edit: Yesterday, I was tired when I wrote the last update so I forgot to mention a few things. These results are extremely generous to Tensorflow.
+
+During testing I forgot to include the time it takes to evaluate the validation set which is a seventh of the training set's size. If I did so, Tensorflow would be on par or slower than Spiral. The reason why I forgot is because Tensorflow [needlessly recalculates](http://stackoverflow.com/questions/36917550/is-each-end-node-evaluation-supposed-to-trigger-a-recalculation-of-the-whole-gra) the whole graph on each end node evaluation, so I simply left out printing of the results (and forgot to leave in the validation set.)
