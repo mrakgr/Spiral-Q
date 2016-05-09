@@ -2019,7 +2019,6 @@ type BNResidualFullyConnectedLayer =
         member t.SGD learning_rate = (t :> INNet).ToArray |> Array.iter (sgd learning_rate)
 
 /// Adapted from the previous version of the library.
-/// An optimized implementation will be done in the future along with union types and streams.
 type LSTMLayer =
     {
     W_z:d4MUnion  // Input weight matrix for the block input
@@ -2083,7 +2082,7 @@ type LSTMLayer =
         P_i = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
         W_f = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
         U_f = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
-        b_f = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1)
+        b_f = d4MUnion.makeUniformRandomNode (1, hidden_size, 1, 1) // TODO: Do not forget about the forget gate bias trick. It might be better to initialize these gates to 1 instead of random.
         P_f = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)
         W_o = d4MUnion.makeUniformRandomNode (input_size, hidden_size, 1, 1)
         U_o = d4MUnion.makeUniformRandomNode (hidden_size, hidden_size, 1, 1)

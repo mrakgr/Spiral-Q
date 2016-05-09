@@ -150,7 +150,7 @@ and d4M =
     member t.A' = t.nchw,t.A.Value.DevicePointer
 
     /// Checks if the type is singular and then returns its dimensions.
-    member t.nchw = t.nchw
+    member t.nchw = t.size
 
     /// Checks if the type is singular and then returns its dimensions projected 
     /// to a 2D space according to the following formula:
