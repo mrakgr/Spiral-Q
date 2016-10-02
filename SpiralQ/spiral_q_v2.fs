@@ -13,12 +13,12 @@ let stream_num = 32
 let bfh x = if remove_biases_flag then None else x
 
 #if INTERACTIVE
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaDNNv5\bin\Release\CudaDNNv5.dll"
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaBlas\bin\x64\Release\CudaBlas.dll"
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\NVRTC\bin\x64\Release\NVRTC.dll"
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\CudaRand\bin\x64\Release\CudaRand.dll"
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\NPP\bin\x64\Release\NPP.dll"
-#r @"C:\Users\Marko\Documents\Visual Studio 2015\Projects\managedCuda\ManagedCUDA\bin\Release\ManagedCuda.dll"
+#r "../packages/ManagedCuda-75-x64.7.5.7/lib/net45/x64/ManagedCuda.dll"
+#r "../packages/ManagedCuda-75-x64.7.5.7/lib/net45/x64/NVRTC.dll"
+#r "../packages/ManagedCuda-75-x64.7.5.7/lib/net45/x64/CudaBlas.dll"
+#r "../packages/ManagedCuda-75-x64.7.5.7/lib/net45/x64/CudaRand.dll"
+#r "../packages/ManagedCuda-75-x64.7.5.7/lib/net45/x64/NPP.dll"
+#r "../packages/ManagedCuda-CudaDNN.5.0.1/lib/net45/CudaDNN.dll"
 #endif
 
 // Open up the namespaces.
@@ -28,7 +28,7 @@ open ManagedCuda.VectorTypes
 open ManagedCuda.CudaBlas
 open ManagedCuda.CudaRand
 open ManagedCuda.NVRTC
-open ManagedCuda.CudaDNNv5
+open ManagedCuda.CudaDNN
 
 open System
 open System.Collections.Generic

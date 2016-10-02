@@ -29,9 +29,12 @@
     <Optimize>true</Optimize>
     <Tailcalls>true</Tailcalls>
     <OutputPath>bin\Release\</OutputPath>
-    <DefineConstants>TRACE</DefineConstants>
+    <DefineConstants>
+    </DefineConstants>
     <WarningLevel>3</WarningLevel>
     <DocumentationFile>bin\Release\SpiralQ.XML</DocumentationFile>
+    <Prefer32Bit>false</Prefer32Bit>
+    <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
   <PropertyGroup>
     <MinimumVisualStudioVersion Condition="'$(MinimumVisualStudioVersion)' == ''">11</MinimumVisualStudioVersion>
@@ -52,34 +55,56 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <Content Include="packages.config" />
-    <None Include="spiral_q_v2.fsx" />
+    <None Include="Scripts\load-references-release.fsx" />
+    <None Include="Scripts\load-project-release.fsx" />
+    <None Include="mnist_conv_net_example.fsx" />
+    <None Include="mnist_bn_conv_net_example.fsx" />
+    <Compile Include="spiral_q_v2.fs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBlas">
-      <HintPath>..\..\managedCuda\CudaBlas\bin\x64\Release\CudaBlas.dll</HintPath>
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\CudaBlas.dll</HintPath>
+      <Private>True</Private>
     </Reference>
-    <Reference Include="CudaDNNv5">
-      <HintPath>..\..\managedCuda\CudaDNNv5\bin\Release\CudaDNNv5.dll</HintPath>
+    <Reference Include="CudaDNN">
+      <HintPath>..\packages\ManagedCuda-CudaDNN.5.0.1\lib\net45\CudaDNN.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="CudaFFT">
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\CudaFFT.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="CudaRand">
-      <HintPath>..\..\managedCuda\CudaRand\bin\x64\Release\CudaRand.dll</HintPath>
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\CudaRand.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="CudaSolve">
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\CudaSolve.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="CudaSparse">
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\CudaSparse.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="FSharp.Charting">
       <HintPath>..\packages\FSharp.Charting.0.90.14\lib\net40\FSharp.Charting.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="ManagedCuda">
-      <HintPath>..\..\managedCuda\ManagedCUDA\bin\Release\ManagedCuda.dll</HintPath>
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\ManagedCuda.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="mscorlib" />
     <Reference Include="FSharp.Core, Version=$(TargetFSharpCoreVersion), Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a">
       <Private>True</Private>
     </Reference>
     <Reference Include="NPP">
-      <HintPath>..\..\managedCuda\NPP\bin\x64\Release\NPP.dll</HintPath>
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\NPP.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="NVRTC">
-      <HintPath>..\..\managedCuda\NVRTC\bin\x64\Release\NVRTC.dll</HintPath>
+      <HintPath>..\packages\ManagedCuda-75-x64.7.5.7\lib\net45\x64\NVRTC.dll</HintPath>
+      <Private>True</Private>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
